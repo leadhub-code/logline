@@ -3,7 +3,7 @@ name = "logline-agent"
 version = "0.0.1"
 description = "Logline Agent"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",

@@ -1,15 +1,4 @@
-import asyncio
-from functools import partial
-
-
-try:
-    from asyncio import to_thread
-except ImportError:
-    # asyncio.to_thread is available only in Python 3.9+
-    # so for older Python version here is our polyfill:
-    async def to_thread(func, *args, **kwargs):
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+from asyncio import to_thread
 
 
 async def decompress_zst(compressed_data):
