@@ -1,7 +1,7 @@
 from argparse import ArgumentParser
 from asyncio import run, sleep, start_server
 from base64 import b64encode
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 import gzip
 import hashlib
@@ -101,10 +101,9 @@ async def handle_client(conf, reader, writer):
         if command != 'logline-agent-v1' or data:
             raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
         header = metadata
-        assert header['hostname']
-        assert header['path']
-        assert header['prefix']
-        assert header['auth']
+        for field in ('hostname', 'path', 'prefix', 'auth'):
+            if not header.get(field):
+                raise ProtocolError(f"Missing {field!r} in header")
 
         check_client_auth(conf, header.get('auth'))
 
@@ -112,11 +111,8 @@ async def handle_client(conf, reader, writer):
             conf.destination_directory, header['hostname'], header['path'])
 
         if not dst_path.parent.is_dir():
-            if not dst_path.parent.parent.is_dir():
-                logger.debug('Creating directory: %s', dst_path.parent.parent)
-                dst_path.parent.parent.mkdir()
             logger.debug('Creating directory: %s', dst_path.parent)
-            dst_path.parent.mkdir()
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             f = dst_path.open('rb+')
@@ -134,7 +130,7 @@ async def handle_client(conf, reader, writer):
                 logger.info('File has different prefix, rotating: %s', dst_path)
                 f.close()
                 f = None
-                iso_dt = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+                iso_dt = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 dst_path.rename(dst_path.with_name(dst_path.name + f".rotated-{iso_dt}"))
 
         if not f:
@@ -149,8 +145,9 @@ async def handle_client(conf, reader, writer):
         while True:
             command, metadata, data = await recv_command(reader)
             if command != 'data':
-                raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
-            assert isinstance(data, bytes)
+                raise ProtocolError(f"Expected 'data' command, received {smart_repr(command)}")
+            if not isinstance(data, bytes):
+                raise ProtocolError("'data' command without a payload")
             if metadata.get('compression') == 'gzip':
                 data = await to_thread(gzip.decompress, data)
             elif metadata.get('compression') == 'lzma':
@@ -159,7 +156,9 @@ async def handle_client(conf, reader, writer):
                 data = await decompress_zst(data)
             elif metadata.get('compression') != None:
                 raise Exception(f"Unsupported compression method: {metadata['compression']}")
-            assert f.tell() == metadata['offset']
+            if f.tell() != metadata.get('offset'):
+                raise ProtocolError(
+                    'Offset mismatch: file is at {}, client sent {!r}'.format(f.tell(), metadata.get('offset')))
             logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
             f.write(data)
             f.flush()
