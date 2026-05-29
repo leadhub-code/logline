@@ -1,0 +1,14 @@
+[tool.uv.workspace]
+members = ["agent", "server"]
+
+[tool.uv.sources]
+logline-agent = { workspace = true }
+logline-server = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "logline-agent",
+    "logline-server",
+    "pytest",
+    "flake8",
+]

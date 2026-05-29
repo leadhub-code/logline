@@ -1,8 +1,10 @@
 FROM python:3.9-slim
 
-COPY logline_server /src/logline_server
-COPY pyproject.toml setup.cfg setup.py /src/
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-RUN pip install /src
+COPY logline_server /src/logline_server
+COPY pyproject.toml README.md /src/
+
+RUN uv pip install --system /src
 
 ENTRYPOINT ["logline-server"]
