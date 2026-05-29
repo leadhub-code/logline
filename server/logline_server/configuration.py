@@ -56,6 +56,10 @@ class Configuration:
         else:
             raise ConfigurationError('Destination directory not configured')
 
+        if not self.destination_directory.is_dir():
+            raise ConfigurationError(
+                'Destination directory does not exist: {}'.format(self.destination_directory))
+
         if args.tls_cert:
             self.tls_cert_file = args.tls_cert
         elif cfg.get('tls', {}).get('cert'):
@@ -66,7 +70,7 @@ class Configuration:
         if args.tls_key:
             self.tls_key_file = args.tls_key
         elif cfg.get('tls', {}).get('key'):
-            self.tls_key_file = cfg['tls']['key']
+            self.tls_key_file = cfg_dir / cfg['tls']['key']
         else:
             self.tls_key_file = None
 
@@ -78,6 +82,8 @@ class Configuration:
             self.tls_password = cfg['tls']['key_password']
         elif os.environ.get('TLS_KEY_PASSWORD'):
             self.tls_password = os.environ['TLS_KEY_PASSWORD']
+        else:
+            self.tls_password = None
 
         self.use_tls = bool(self.tls_cert_file)
 
