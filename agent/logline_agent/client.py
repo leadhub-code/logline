@@ -107,6 +107,8 @@ class ClientConnection:
         await wait_for(self.writer.drain(), timeout=socket_timeout)
         reply_line = await wait_for(self.reader.readline(), timeout=socket_timeout)
         #logger.debug('Received reply line %r', reply_line)
+        if not reply_line:
+            raise ClientError('Connection closed by server before reply')
         reply_line_parts = reply_line.decode('ascii').split()
         if len(reply_line_parts) == 2:
             reply_status, reply_length = reply_line_parts
@@ -142,7 +144,7 @@ assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
 
 def obfuscate_secrets(json_str):
     assert isinstance(json_str, str)
-    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, re.ASCII)
+    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, flags=re.ASCII)
     return json_str
 
 
