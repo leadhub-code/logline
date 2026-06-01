@@ -96,6 +96,28 @@ class Configuration:
         if not self.client_token_hashes:
             raise ConfigurationError('No client token hashes configured')
 
+        if getattr(args, 'workers', None) is not None:
+            self.workers = resolve_workers(args.workers)
+        elif cfg.get('workers') is not None:
+            self.workers = resolve_workers(cfg['workers'])
+        else:
+            self.workers = 1
+
+
+def resolve_workers(value):
+    '''
+    Resolve the configured worker count to a positive integer.
+
+    ``None`` -> 1 (single-process, unchanged behaviour). The literal ``auto``
+    or ``0`` -> number of CPUs. Anything else is parsed as an int (clamped to
+    at least 1).
+    '''
+    if value is None:
+        return 1
+    if str(value).strip().lower() in ('auto', '0'):
+        return os.cpu_count() or 1
+    return max(1, int(value))
+
 
 def parse_address(s):
     m = re.match(r'^([^:]+):([0-9]+)$', s)

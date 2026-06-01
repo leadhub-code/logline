@@ -9,6 +9,9 @@ from io import SEEK_END
 import json
 from logging import getLogger
 import lzma
+import os
+import signal
+from time import monotonic as monotime
 from reprlib import repr as smart_repr
 
 from .configuration import Configuration
@@ -29,11 +32,15 @@ def server_main():
     p.add_argument('--tls-key', help='path to the file with key in PEM format')
     p.add_argument('--tls-key-password-file', help='path to the file with key password in plaintext')
     p.add_argument('--client-token-hash', action='append')
+    p.add_argument('--workers', help="number of worker processes, or 'auto' for one per CPU")
     args = p.parse_args()
     setup_logging(verbose=args.verbose)
     conf = Configuration(args=args)
     setup_log_file(conf.log_file)
-    run(async_main(conf))
+    if conf.workers > 1:
+        run_workers(conf)
+    else:
+        run(async_main(conf))
 
 
 log_format = '%(asctime)s [%(process)d] %(name)s %(levelname)5s: %(message)s'
@@ -81,10 +88,99 @@ async def async_main(conf):
     server = await start_server(
         partial(handle_client, conf),
         conf.bind_host, conf.bind_port,
-        ssl=ssl_context)
+        ssl=ssl_context,
+        # SO_REUSEPORT lets every worker bind the same port; the kernel
+        # load-balances connections across them. Only needed (and only
+        # portable) in the multi-worker case - keep single-process identical.
+        reuse_port=(conf.workers > 1))
     logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
     async with server:
         await server.serve_forever()
+
+
+def run_workers(conf):
+    '''
+    Fork ``conf.workers`` worker processes, each running its own event loop and
+    binding the listening socket with SO_REUSEPORT. The parent stays in the
+    foreground and supervises: when a worker dies it is restarted in place, so a
+    single worker crash only drops that worker's connections (the agent
+    reconnects). SIGTERM/SIGINT are forwarded to the workers for clean shutdown.
+    '''
+    # rapid-crash guard: if a freshly spawned worker keeps dying immediately
+    # (e.g. the bind fails), stop fork-looping and surface the failure.
+    min_healthy_uptime = 5.0
+    max_rapid_deaths = conf.workers * 3
+    rapid_deaths = 0
+
+    children = {}  # pid -> spawn monotime
+    shutting_down = False
+
+    def spawn():
+        pid = os.fork()
+        if pid == 0:
+            # child: drop the parent's signal handlers and run the server
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            try:
+                run(async_main(conf))
+            except KeyboardInterrupt:
+                os._exit(0)
+            except BaseException as e:
+                logger.exception('Worker failed: %r', e)
+                os._exit(1)
+            else:
+                os._exit(0)
+        children[pid] = monotime()
+        logger.info('Started worker process %d (%d/%d)', pid, len(children), conf.workers)
+
+    def handle_signal(signum, frame):
+        nonlocal shutting_down
+        shutting_down = True
+        logger.info('Received signal %d, stopping %d worker(s)', signum, len(children))
+        for pid in list(children):
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    for _ in range(conf.workers):
+        spawn()
+
+    while children:
+        try:
+            pid, status = os.wait()
+        except ChildProcessError:
+            break
+        except InterruptedError:
+            continue
+        started = children.pop(pid, None)
+        if shutting_down:
+            logger.info('Worker %d exited (status %d)', pid, status)
+            continue
+        uptime = monotime() - started if started is not None else None
+        logger.warning('Worker %d died (status %d, uptime %.1fs), restarting',
+                       pid, status, uptime if uptime is not None else -1)
+        if uptime is not None and uptime < min_healthy_uptime:
+            rapid_deaths += 1
+            if rapid_deaths >= max_rapid_deaths:
+                logger.error('Too many worker crashes on startup, giving up')
+                for p in list(children):
+                    try:
+                        os.kill(p, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                raise SystemExit(1)
+            sleep_before_respawn(1.0)
+        spawn()
+
+
+def sleep_before_respawn(seconds):
+    # plain blocking sleep in the supervisor (no event loop here)
+    import time
+    time.sleep(seconds)
 
 
 async def handle_client(conf, reader, writer):

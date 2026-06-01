@@ -251,6 +251,51 @@ def test_rotate_log_file(tmp_path):
             sleep(.1)
 
 
+def test_multiple_workers_serve_files(tmp_path):
+    chdir(tmp_path)
+    Path('agent-src').mkdir()
+    Path('server-dst').mkdir()
+    mangled_src_path = str(Path('agent-src').resolve()).strip('/').replace('/', '~')
+    Path('agent-src/first.log').write_text('2021-02-22 17:00:00 First file\n')
+    Path('agent-src/second.log').write_text('2021-02-22 17:00:10 Second file\n')
+    expected_first = Path('server-dst') / getfqdn() / mangled_src_path / 'first.log'
+    expected_second = Path('server-dst') / getfqdn() / mangled_src_path / 'second.log'
+    port = 9998
+    with ExitStack() as stack:
+        agent_cmd = [
+            'logline-agent',
+            '--scan', 'agent-src/*.log',
+            '--server', f'127.0.0.1:{port}',
+        ]
+        server_cmd = [
+            'logline-server',
+            '--bind', f'127.0.0.1:{port}',
+            '--dest', 'server-dst',
+            '--client-token-hash', client_token_hash,
+            '--workers', '2',
+        ]
+        server_process = stack.enter_context(Popen(server_cmd))
+        stack.callback(terminate_process, server_process)
+        sleep(.2)
+        agent_process = stack.enter_context(Popen(agent_cmd, env={**os.environ, 'CLIENT_TOKEN': client_token}))
+        stack.callback(terminate_process, agent_process)
+        t0 = monotime()
+        sleep(.1)
+        while True:
+            logger.debug('Checking after %.2f s...', monotime() - t0)
+            # the supervisor (parent) must stay alive while workers serve
+            assert agent_process.poll() is None
+            assert server_process.poll() is None
+            if (expected_first.exists() and expected_second.exists()
+                    and expected_first.read_text() == '2021-02-22 17:00:00 First file\n'
+                    and expected_second.read_text() == '2021-02-22 17:00:10 Second file\n'):
+                logger.debug('Both destination files created via workers')
+                break
+            if monotime() - t0 > 3:
+                raise Exception('Deadline exceeded')
+            sleep(.2)
+
+
 def terminate_process(p):
     if p.poll() is None:
         logger.info('Terminating process %s args: %s', p.pid, ' '.join(p.args))
