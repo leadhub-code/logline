@@ -92,7 +92,7 @@ async def create_server(conf):
         try:
             from socket import SO_REUSEPORT  # noqa: F401
         except ImportError:
-            raise ConfigurationError('--reuse-port was requested but SO_REUSEPORT is not supported on this platform')
+            raise ConfigurationError('--reuse-port was requested but SO_REUSEPORT is not supported on this platform') from None
     return await start_server(
         partial(handle_client, conf),
         conf.bind_host, conf.bind_port,
