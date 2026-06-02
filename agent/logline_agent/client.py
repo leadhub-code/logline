@@ -18,6 +18,10 @@ logger = getLogger(__name__)
 
 socket_timeout = 300
 
+# Establishing the TCP/TLS connection should be quick; without a timeout a
+# silent or unreachable server would make open_connection() hang indefinitely.
+connect_timeout = 30
+
 
 class ClientError (Exception):
     pass
@@ -38,7 +42,9 @@ async def connect_to_server(conf, log_path, log_prefix):
             cafile=str(conf.tls_cert_file) if conf.tls_cert_file else None)
     else:
         ssl_context = None
-    reader, writer = await open_connection(conf.server_host, conf.server_port, ssl=ssl_context)
+    reader, writer = await wait_for(
+        open_connection(conf.server_host, conf.server_port, ssl=ssl_context),
+        timeout=connect_timeout)
     cc = ClientConnection(reader, writer)
     await cc.send_header({
         'hostname': getfqdn(),
