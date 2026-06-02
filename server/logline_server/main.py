@@ -1,5 +1,5 @@
 from argparse import ArgumentParser
-from asyncio import run, start_server, to_thread
+from asyncio import TimeoutError, run, start_server, to_thread, wait_for
 from base64 import b64encode
 from datetime import datetime, timezone
 from functools import partial
@@ -18,6 +18,13 @@ from .util import decompress_zst
 
 
 logger = getLogger(__name__)
+
+# How long to wait for a freshly connected client to send its initial command
+# before giving up. This guards against connections that occupy a slot without
+# ever authenticating (e.g. slowloris-style). Established, authenticated
+# connections are intentionally allowed to stay idle for as long as needed,
+# since the agent only sends data when the watched log grows.
+handshake_timeout = 30
 
 
 def server_main():
@@ -91,10 +98,13 @@ async def handle_client(conf, reader, writer):
         addr = writer.get_extra_info('peername')
         logger.info('New client has connected: %s', addr)
         try:
-            command, metadata, data = await recv_command(reader, first=True)
+            command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
         except ReceivedHTTPRequestError:
             logger.info('Received like HTTP request')
             await send_http_response(writer)
+            return
+        except TimeoutError:
+            logger.info('Client did not send the initial command within %s s, closing connection', handshake_timeout)
             return
         if command != 'logline-agent-v1' or data:
             raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
