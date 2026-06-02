@@ -109,12 +109,13 @@ async def handle_client(conf, reader, writer):
         if command != 'logline-agent-v1' or data:
             raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
         header = metadata
-        assert header['hostname']
-        assert header['path']
-        assert header['prefix']
-        assert header['auth']
+        if not isinstance(header, dict):
+            raise ProtocolError(f'Expected a JSON object as header, received {smart_repr(header)}')
+        for field in ('hostname', 'path', 'prefix', 'auth'):
+            if not header.get(field):
+                raise ProtocolError(f'Missing required header field: {field}')
 
-        check_client_auth(conf, header.get('auth'))
+        check_client_auth(conf, header['auth'])
 
         dst_path = build_destination_path(
             conf.destination_directory, header['hostname'], header['path'])
@@ -158,7 +159,8 @@ async def handle_client(conf, reader, writer):
             command, metadata, data = await recv_command(reader)
             if command != 'data':
                 raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
-            assert isinstance(data, bytes)
+            if not isinstance(data, bytes):
+                raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
             if metadata.get('compression') == 'gzip':
                 data = await to_thread(gzip.decompress, data)
             elif metadata.get('compression') == 'lzma':
@@ -167,7 +169,9 @@ async def handle_client(conf, reader, writer):
                 data = await decompress_zst(data)
             elif metadata.get('compression') is not None:
                 raise Exception(f"Unsupported compression method: {metadata['compression']}")
-            assert f.tell() == metadata['offset']
+            offset = metadata.get('offset')
+            if offset != f.tell():
+                raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
             logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
             f.write(data)
             f.flush()
