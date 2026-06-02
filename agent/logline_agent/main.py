@@ -7,9 +7,9 @@ from os import fstat
 from pathlib import Path
 from time import monotonic as monotime
 
-from .asyncio_helpers import run, create_task
-from .configuration import Configuration
+from .asyncio_helpers import create_task, run
 from .client import connect_to_server
+from .configuration import Configuration
 
 
 logger = getLogger(__name__)
@@ -53,7 +53,7 @@ stderr_log_handler = None
 
 def setup_logging(verbose):
     global stderr_log_handler
-    from logging import DEBUG, INFO, getLogger, Formatter, StreamHandler
+    from logging import DEBUG, INFO, Formatter, StreamHandler, getLogger
     h = StreamHandler()
     h.setFormatter(Formatter(log_format))
     h.setLevel(DEBUG if verbose else INFO)
@@ -63,7 +63,7 @@ def setup_logging(verbose):
 
 
 def setup_log_file(log_file_path):
-    from logging import DEBUG, INFO, ERROR, getLogger, Formatter
+    from logging import DEBUG, ERROR, INFO, Formatter, getLogger
     from logging.handlers import WatchedFileHandler
     if not log_file_path:
         return

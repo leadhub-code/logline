@@ -1,5 +1,5 @@
 from argparse import ArgumentParser
-from asyncio import run, sleep, start_server
+from asyncio import run, start_server
 from base64 import b64encode
 from datetime import datetime
 from functools import partial
@@ -12,7 +12,7 @@ import lzma
 from reprlib import repr as smart_repr
 
 from .configuration import Configuration
-from .util import to_thread, decompress_zst
+from .util import decompress_zst, to_thread
 
 
 logger = getLogger(__name__)
@@ -43,7 +43,7 @@ stderr_log_handler = None
 
 def setup_logging(verbose):
     global stderr_log_handler
-    from logging import DEBUG, INFO, getLogger, Formatter, StreamHandler
+    from logging import DEBUG, INFO, Formatter, StreamHandler, getLogger
     h = StreamHandler()
     h.setFormatter(Formatter(log_format))
     h.setLevel(DEBUG if verbose else INFO)
@@ -53,7 +53,7 @@ def setup_logging(verbose):
 
 
 def setup_log_file(log_file_path):
-    from logging import DEBUG, INFO, ERROR, getLogger, Formatter
+    from logging import DEBUG, ERROR, INFO, Formatter, getLogger
     from logging.handlers import WatchedFileHandler
     if not log_file_path:
         return
@@ -69,7 +69,7 @@ def setup_log_file(log_file_path):
 
 async def async_main(conf):
     if conf.use_tls:
-        from ssl import create_default_context, Purpose
+        from ssl import Purpose, create_default_context
         ssl_context = create_default_context(purpose=Purpose.CLIENT_AUTH)
         logger.debug('Using TLS; certfile: %s keyfile: %s', conf.tls_cert_file, conf.tls_key_file)
         ssl_context.load_cert_chain(
@@ -94,7 +94,7 @@ async def handle_client(conf, reader, writer):
         logger.info('New client has connected: %s', addr)
         try:
             command, metadata, data = await recv_command(reader, first=True)
-        except ReceivedHTTPRequestError as e:
+        except ReceivedHTTPRequestError:
             logger.info('Received like HTTP request')
             await send_http_response(writer)
             return
@@ -157,7 +157,7 @@ async def handle_client(conf, reader, writer):
                 data = await to_thread(lzma.decompress, data)
             elif metadata.get('compression') == 'zst':
                 data = await decompress_zst(data)
-            elif metadata.get('compression') != None:
+            elif metadata.get('compression') is not None:
                 raise Exception(f"Unsupported compression method: {metadata['compression']}")
             assert f.tell() == metadata['offset']
             logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
@@ -240,7 +240,7 @@ def check_client_auth(conf, header_auth):
             logger.debug('Client token verified with SHA1 hash %s', sha1_hex(ct_bytes))
             return
         raise Exception(f'Unknown client token; hash: {sha1_hex(ct_bytes)}')
-    raise Exception(f'Client token was not received in header')
+    raise Exception('Client token was not received in header')
 
 
 class ConnectionClosed (Exception):

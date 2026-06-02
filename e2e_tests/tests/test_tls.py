@@ -4,13 +4,11 @@ from logging import getLogger
 import os
 from os import chdir
 from pathlib import Path
-from pytest import skip
 from socket import getfqdn
 from subprocess import Popen, check_call
-import sys
 from textwrap import dedent
-from time import sleep
 from time import monotonic as monotime
+from time import sleep
 
 
 logger = getLogger(__name__)

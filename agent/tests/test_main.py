@@ -1,7 +1,7 @@
+from pytest import fixture
+
 from logline_agent.configuration import Configuration
 from logline_agent.main import get_argument_parser, iter_files
-
-from pytest import fixture
 
 
 @fixture

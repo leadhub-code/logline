@@ -19,3 +19,13 @@ package = false
 [tool.uv.sources]
 logline-agent = { path = "../agent", editable = true }
 logline-server = { path = "../server", editable = true }
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+lines-after-imports = 2

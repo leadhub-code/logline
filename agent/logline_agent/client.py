@@ -5,12 +5,11 @@ Client for the Logline Server
 from asyncio import open_connection, wait_for
 from base64 import b64encode
 import gzip
+import json
 from logging import getLogger
 import re
-from reprlib import repr as smart_repr
 from socket import getfqdn
 from time import monotonic as monotime
-import json
 
 from .asyncio_helpers import to_thread
 
@@ -33,7 +32,7 @@ async def connect_to_server(conf, log_path, log_prefix):
     assert isinstance(conf.client_token, str)
     logger.debug('Connecting to %s:%s', conf.server_host, conf.server_port)
     if conf.use_tls:
-        from ssl import create_default_context, Purpose
+        from ssl import Purpose, create_default_context
         logger.debug('Using TLS; cafile: %s', conf.tls_cert_file or '-')
         ssl_context = create_default_context(
             purpose=Purpose.SERVER_AUTH,

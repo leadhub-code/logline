@@ -1,8 +1,6 @@
-from pathlib import Path
-
 from pytest import raises
 
-from logline_server.main import build_destination_path, ProtocolError
+from logline_server.main import ProtocolError, build_destination_path
 
 
 def test_normal_path(tmp_path):

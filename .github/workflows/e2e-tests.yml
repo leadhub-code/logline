@@ -1,5 +1,5 @@
-# This workflow installs the agent and server with uv and runs the end-to-end
-# test suite across a range of Python versions.
+# This workflow installs the agent and server with uv, lints with ruff and runs
+# the end-to-end test suite across a range of Python versions.
 # For more information see: https://docs.astral.sh/uv/guides/integration/github/
 
 name: E2E tests
@@ -29,6 +29,10 @@ jobs:
       uses: astral-sh/setup-uv@v6
       with:
         python-version: ${{ matrix.python-version }}
+    - name: Lint with ruff
+      run: |
+        cd e2e_tests
+        uvx ruff check .
     - name: Test with pytest
       run: |
         cd e2e_tests
