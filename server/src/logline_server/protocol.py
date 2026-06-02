@@ -1,37 +1,60 @@
 '''
-msgspec models for the Logline agent-server wire protocol.
+msgspec models for the logline/2 control-frame payloads (see Protocol.md).
 
-These describe the JSON metadata exchanged on the wire (see Protocol.md).
 Only the server uses these typed models. The agent is deliberately
 stdlib-only -- it must run on Debian 11/12 without a venv, where msgspec is
 not available -- and builds the same JSON with the standard library instead.
 '''
 
-from typing import Optional
-
 from msgspec import Struct
 
 
-class Prefix(Struct):
-    length: int
-    sha1: str
+PROTOCOL_VERSION = 'logline/2'
 
 
 class Auth(Struct):
-    client_token: str
+    token: str
 
 
-class Header(Struct):
+class Hello(Struct):
+    protocol: str
     hostname: str
+    auth: Auth
+
+
+class HelloAck(Struct):
+    max_frame_size: int
+    ack_interval: float
+
+
+class Prefix(Struct):
+    size: int
+    sha256: str
+
+
+class Open(Struct):
     path: str
     prefix: Prefix
-    auth: Auth
+
+
+class OpenAck(Struct):
+    offset: int
 
 
 class DataMeta(Struct):
     offset: int
-    compression: Optional[str] = None
+    codec: str
+    raw_size: int
 
 
-class OkLengthReply(Struct):
-    length: int
+class Ack(Struct):
+    offset: int
+
+
+class Close(Struct):
+    reason: str = ''
+
+
+class Error(Struct):
+    code: str
+    message: str

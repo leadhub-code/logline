@@ -1,33 +1,16 @@
 from argparse import ArgumentParser
-from asyncio import TimeoutError, run, start_server, to_thread, wait_for
-from base64 import b64encode
-from datetime import datetime, timezone
-from functools import partial
-import gzip
-from hashlib import sha1
-from io import SEEK_END
+from asyncio import CancelledError, Event, create_task, get_running_loop, run, start_server
+from contextlib import suppress
 from logging import DEBUG, ERROR, INFO, Formatter, StreamHandler, getLogger
 from logging.handlers import WatchedFileHandler
-import lzma
-from reprlib import repr as smart_repr
+from signal import SIGINT, SIGTERM
 from ssl import Purpose, create_default_context
 
-from msgspec import MsgspecError
-from msgspec.json import decode, encode
-
 from .configuration import Configuration
-from .protocol import DataMeta, Header, OkLengthReply
-from .util import decompress_zst
+from .session import ServerSession
 
 
 logger = getLogger(__name__)
-
-# How long to wait for a freshly connected client to send its initial command
-# before giving up. This guards against connections that occupy a slot without
-# ever authenticating (e.g. slowloris-style). Established, authenticated
-# connections are intentionally allowed to stay idle for as long as needed,
-# since the agent only sends data when the watched log grows.
-handshake_timeout = 30
 
 
 def server_main():
@@ -41,6 +24,7 @@ def server_main():
     p.add_argument('--tls-key', help='path to the file with key in PEM format')
     p.add_argument('--tls-key-password-file', help='path to the file with key password in plaintext')
     p.add_argument('--client-token-hash', action='append')
+    p.add_argument('--fsync', action='store_true', help='fsync received data before acknowledging it')
     args = p.parse_args()
     setup_logging(verbose=args.verbose)
     conf = Configuration(args=args)
@@ -70,278 +54,41 @@ def setup_log_file(log_file_path):
     h.setFormatter(Formatter(log_format))
     h.setLevel(DEBUG)
     getLogger('').addHandler(h)
-    if stderr_log_handler:
+    if stderr_log_handler and stderr_log_handler.level == INFO:
         # decrease stderr handler level since we are logging into file instead
-        if stderr_log_handler.level == INFO:
-            stderr_log_handler.setLevel(ERROR)
+        stderr_log_handler.setLevel(ERROR)
 
 
 async def async_main(conf):
-    if conf.use_tls:
-        ssl_context = create_default_context(purpose=Purpose.CLIENT_AUTH)
-        logger.debug('Using TLS; certfile: %s keyfile: %s', conf.tls_cert_file, conf.tls_key_file)
-        ssl_context.load_cert_chain(
-            certfile=conf.tls_cert_file,
-            keyfile=conf.tls_key_file,
-            password=conf.tls_password)
-    else:
-        ssl_context = None
-    server = await start_server(
-        partial(handle_client, conf),
-        conf.bind_host, conf.bind_port,
-        ssl=ssl_context)
+    ssl_context = make_ssl_context(conf)
+    shutdown = Event()
+    loop = get_running_loop()
+    for sig in (SIGTERM, SIGINT):
+        with suppress(NotImplementedError):
+            loop.add_signal_handler(sig, shutdown.set)
+
+    async def handle(reader, writer):
+        await ServerSession(conf, reader, writer).run()
+
+    server = await start_server(handle, conf.bind_host, conf.bind_port, ssl=ssl_context)
     logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
     async with server:
-        await server.serve_forever()
+        serve_task = create_task(server.serve_forever())
+        await shutdown.wait()
+        logger.info('Shutdown requested, no longer accepting connections')
+        server.close()
+        serve_task.cancel()
+        with suppress(CancelledError):
+            await serve_task
 
 
-async def handle_client(conf, reader, writer):
-    f = None
-    try:
-        addr = writer.get_extra_info('peername')
-        logger.info('New client has connected: %s', addr)
-        try:
-            command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
-        except ReceivedHTTPRequestError:
-            logger.info('Received like HTTP request')
-            await send_http_response(writer)
-            return
-        except TimeoutError:
-            logger.info('Client did not send the initial command within %s s, closing connection', handshake_timeout)
-            return
-        if command != 'logline-agent-v1' or data:
-            raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
-        header = decode_message(metadata, Header)
-
-        check_client_auth(conf, header.auth)
-
-        dst_path = build_destination_path(
-            conf.destination_directory, header.hostname, header.path)
-
-        if not dst_path.parent.is_dir():
-            if not dst_path.parent.parent.is_dir():
-                logger.debug('Creating directory: %s', dst_path.parent.parent)
-                dst_path.parent.parent.mkdir()
-            logger.debug('Creating directory: %s', dst_path.parent)
-            dst_path.parent.mkdir()
-
-        try:
-            f = dst_path.open('rb+')
-        except FileNotFoundError:
-            f = None
-            logger.debug('File does not exist yet: %s', dst_path)
-        else:
-            assert f.tell() == 0
-            f_prefix = f.read(header.prefix.length)
-            if f_prefix and sha1_b64(f_prefix) == header.prefix.sha1:
-                # it's the correct file :)
-                logger.info('File has the correct prefix: %s', dst_path)
-            else:
-                # need to create new file
-                logger.info('File has different prefix, rotating: %s', dst_path)
-                f.close()
-                f = None
-                iso_dt = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-                dst_path.rename(dst_path.with_name(dst_path.name + f".rotated-{iso_dt}"))
-
-        if not f:
-            logger.info('Creating new file: %s', dst_path)
-            f = dst_path.open('wb+')
-
-        f.seek(0, SEEK_END)
-        f_length = f.tell()
-
-        await send_reply(writer, 'ok', OkLengthReply(length=f_length))
-
-        while True:
-            command, metadata, data = await recv_command(reader)
-            if command != 'data':
-                raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
-            if not isinstance(data, bytes):
-                raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
-            meta = decode_message(metadata, DataMeta)
-            if meta.compression == 'gzip':
-                data = await to_thread(gzip.decompress, data)
-            elif meta.compression == 'lzma':
-                data = await to_thread(lzma.decompress, data)
-            elif meta.compression == 'zst':
-                data = await decompress_zst(data)
-            elif meta.compression is not None:
-                raise Exception(f"Unsupported compression method: {meta.compression}")
-            if meta.offset != f.tell():
-                raise ProtocolError(f'Unexpected data offset: client sent {meta.offset}, expected {f.tell()}')
-            logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
-            f.write(data)
-            f.flush()
-            await send_reply(writer, 'ok', None)
-
-    except ConnectionClosed:
-        logger.info('Client closed connection')
-    except Exception as e:
-        logger.exception('Failed to handle client: %r', e)
-    finally:
-        logger.info('Closing connection')
-        writer.close()
-        if f:
-            f.close()
-
-
-async def send_http_response(writer):
-    writer.write(b'HTTP/1.0 404 Not Found\r\n')
-    writer.write(b'Content-Type: text/plain\r\n')
-    writer.write(b'\r\n')
-    writer.write(b'This is not a HTTP service.\n')
-    await writer.drain()
-
-
-def _is_safe_path_segment(segment):
-    '''
-    A safe path segment is a non-empty string that refers to a single
-    directory/file entry and cannot be used to traverse the filesystem.
-    '''
-    if not segment or segment in ('.', '..'):
-        return False
-    if '/' in segment or '\\' in segment or '\x00' in segment:
-        return False
-    return True
-
-
-def build_destination_path(destination_directory, hostname, path):
-    '''
-    Build the destination file path for the received log file.
-
-    The hostname and path values come from the (authenticated but otherwise
-    untrusted) client, so they must never be allowed to escape the configured
-    destination directory via path traversal.
-    '''
-    if not _is_safe_path_segment(hostname):
-        raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
-
-    *dir_parts, filename = path.strip('/').split('/')
-    if not _is_safe_path_segment(filename):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
-
-    # dir_parts are joined with '~' into a single path segment, so any '/' they
-    # might contain has already been removed by split('/'); still reject any
-    # remaining traversal or null-byte characters defensively.
-    mangled_dir = '~'.join(dir_parts)
-    if '\x00' in mangled_dir or mangled_dir in ('.', '..'):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
-
-    base = destination_directory.resolve()
-    dst_path = (base / hostname / mangled_dir / filename) if mangled_dir \
-        else (base / hostname / filename)
-
-    # Final defense in depth: make sure the resolved destination really stays
-    # inside the configured destination directory.
-    resolved_parent = dst_path.parent.resolve()
-    if resolved_parent != base and base not in resolved_parent.parents:
-        raise ProtocolError(f'Refusing to write outside destination directory: {smart_repr(str(dst_path))}')
-
-    return dst_path
-
-
-def check_client_auth(conf, header_auth):
-    if not header_auth.client_token:
-        raise Exception('Client token was not received in header')
-    ct_bytes = header_auth.client_token.encode('utf-8')
-    if sha1_hex(ct_bytes) in conf.client_token_hashes:
-        logger.debug('Client token verified with SHA1 hash %s', sha1_hex(ct_bytes))
-        return
-    raise Exception(f'Unknown client token; hash: {sha1_hex(ct_bytes)}')
-
-
-class ConnectionClosed (Exception):
-    pass
-
-
-class ProtocolError (Exception):
-    pass
-
-
-class ReceivedHTTPRequestError (ProtocolError):
-    pass
-
-
-def decode_message(raw, message_type):
-    '''
-    Decode JSON metadata received from the client into the given msgspec
-    model, turning any decoding or validation failure into a ProtocolError.
-    '''
-    if not isinstance(raw, bytes):
-        raise ProtocolError(f'Expected {message_type.__name__} metadata, received none')
-    try:
-        return decode(raw, type=message_type)
-    except MsgspecError as e:
-        raise ProtocolError(f'Invalid {message_type.__name__} message: {e}')
-
-
-async def recv_command(reader, first=False):
-    line = await reader.readline()
-    if not line:
-        raise ConnectionClosed()
-    if first and b'HTTP/' in line:
-        raise ReceivedHTTPRequestError(f'Invalid command line format: {smart_repr(line)}')
-    try:
-        parts = line.decode('ascii').split()
-    except UnicodeDecodeError:
-        raise ProtocolError(f"Failed to parse command line: {smart_repr(line)}")
-    if len(parts) == 1:
-        command, = parts
-        return command, None, None
-    if len(parts) == 2:
-        command, metadata_size = parts
-        if not metadata_size.isdigit():
-            raise ProtocolError(f"Failed to parse command line: {smart_repr(line)}")
-        metadata_size = int(metadata_size)
-        data_size = None
-    elif len(parts) == 3:
-        command, metadata_size, data_size = parts
-        if not metadata_size.isdigit() or not data_size.isdigit():
-            raise ProtocolError(f"Failed to parse command line: {smart_repr(line)}")
-        metadata_size = int(metadata_size)
-        data_size = int(data_size)
-    else:
-        raise ProtocolError(f"Failed to parse command line: {smart_repr(line)}")
-    metadata_bytes = await reader.readexactly(metadata_size)
-    if data_size is None:
-        data = None
-    elif data_size == 0:
-        data = b''
-    else:
-        data = await reader.readexactly(data_size)
-    # The metadata bytes are intentionally not parsed or logged here: the caller
-    # decodes them into a typed model, and the header metadata carries the
-    # client token, which must not be written to the logs.
-    if data is None:
-        logger.debug('Received %s (%d B metadata)', command, len(metadata_bytes))
-    else:
-        logger.debug('Received %s (%d B metadata) + %d B data', command, len(metadata_bytes), len(data))
-    return command, metadata_bytes, data
-
-
-async def send_reply(writer, status, payload):
-    assert isinstance(status, str)
-    if payload is None:
-        writer.write(f'{status}\n'.encode('ascii'))
-        logger.debug('Sent reply %s -', status)
-    else:
-        payload_bytes = encode(payload)
-        writer.write(f'{status} {len(payload_bytes)}\n'.encode('ascii'))
-        writer.write(payload_bytes)
-        logger.debug('Sent reply %s %r', status, payload)
-    await writer.drain()
-
-
-def sha1_b64(data):
-    return b64encode(sha1(data).digest()).decode('ascii')
-
-
-assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
-
-
-def sha1_hex(data):
-    return sha1(data).hexdigest()
-
-
-assert sha1_hex(b'hello') == 'aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d'
+def make_ssl_context(conf):
+    if not conf.use_tls:
+        return None
+    ssl_context = create_default_context(purpose=Purpose.CLIENT_AUTH)
+    logger.debug('Using TLS; certfile: %s keyfile: %s', conf.tls_cert_file, conf.tls_key_file)
+    ssl_context.load_cert_chain(
+        certfile=conf.tls_cert_file,
+        keyfile=conf.tls_key_file,
+        password=conf.tls_password)
+    return ssl_context

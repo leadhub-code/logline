@@ -11,7 +11,7 @@ logger = getLogger(__name__)
 
 class ConfigurationError (Exception):
     '''
-    This exception means that some user input is missing.
+    This exception means that some user input is missing or invalid.
     '''
 
 
@@ -32,8 +32,9 @@ class Configuration:
 
         if cfg_path:
             cfg_dir = cfg_path.parent
-            cfg = yaml.safe_load(cfg_path.read_text())
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
         else:
+            cfg_dir = None
             cfg = {}
 
         if args.log:
@@ -71,6 +72,7 @@ class Configuration:
         else:
             self.tls_key_file = None
 
+        self.tls_password = None
         if args.tls_key_password_file:
             self.tls_password = Path(args.tls_key_password_file).read_text().strip()
         elif cfg.get('tls', {}).get('key_password_file'):
@@ -91,6 +93,23 @@ class Configuration:
         if not self.client_token_hashes:
             raise ConfigurationError('No client token hashes configured')
 
+        # Protocol tuning. Sensible defaults; override via the "tuning" section
+        # of the YAML config.
+        tuning = cfg.get('tuning') or {}
+        self.max_frame_size = int(tuning.get('max_frame_size', 4 * 1024 * 1024))
+        self.handshake_timeout = float(tuning.get('handshake_timeout', 30))
+        self.idle_timeout = float(tuning.get('idle_timeout', 120))
+        self.heartbeat_interval = float(tuning.get('heartbeat_interval', 30))
+        self.ack_interval = float(tuning.get('ack_interval', 0.5))
+
+        # Durability: fsync each sink before acknowledging its data. Off by
+        # default (the OS page cache already survives a process crash); turn it
+        # on to also survive an OS/host crash, at some throughput cost.
+        self.fsync = bool(getattr(args, 'fsync', False) or cfg.get('fsync', False))
+
+        if self.heartbeat_interval >= self.idle_timeout:
+            raise ConfigurationError('heartbeat_interval must be smaller than idle_timeout')
+
 
 def parse_address(s):
     m = re.match(r'^([^:]+):([0-9]+)$', s)
@@ -101,5 +120,4 @@ def parse_address(s):
     if m:
         port, = m.groups()
         return '', int(port)
-    raise Exception(f'Unknown address format: {s}')
-
+    raise ConfigurationError(f'Unknown address format: {s}')
