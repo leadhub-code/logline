@@ -24,6 +24,20 @@ Run `make lint` (or `make check`) to lint the whole repository.
 - Prefer `from X import Y` over `import X` where it reads naturally. This is a
   convention only; ruff has no rule for it.
 
+# Pull requests
+
+When a PR is not based on `main` but on another PR's branch (a stacked PR),
+flag this at the very top of the PR description with a blockquote in this
+exact format:
+
+> **Stacked on #N.** The base of this PR is `<base-branch>`, so the diff
+> shows only the changes specific to this PR. Merge #N first, then this can
+> be retargeted to `main`.
+
+Replace `#N` with the parent PR's number and `<base-branch>` with its head
+branch, and set the PR base accordingly (`gh pr create --base <base-branch>`).
+Use this one style consistently; do not invent per-PR variants.
+
 # Agent workflow
 
 When you finish a coherent unit of work (a task, or a change you would
