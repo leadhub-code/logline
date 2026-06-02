@@ -1,7 +1,7 @@
 from argparse import ArgumentParser
 from asyncio import run, start_server, to_thread
 from base64 import b64encode
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import partial
 import gzip
 from hashlib import sha1
@@ -132,7 +132,7 @@ async def handle_client(conf, reader, writer):
                 logger.info('File has different prefix, rotating: %s', dst_path)
                 f.close()
                 f = None
-                iso_dt = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+                iso_dt = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
                 dst_path.rename(dst_path.with_name(dst_path.name + f".rotated-{iso_dt}"))
 
         if not f:
