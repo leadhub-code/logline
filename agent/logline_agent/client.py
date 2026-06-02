@@ -139,7 +139,7 @@ assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
 
 def obfuscate_secrets(json_str):
     assert isinstance(json_str, str)
-    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, re.ASCII)
+    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, flags=re.ASCII)
     return json_str
 
 
