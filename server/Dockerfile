@@ -13,7 +13,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # because pyproject declares license-files = ["LICENSE"], which uv_build
 # validates while building the project.
 COPY README.md LICENSE ./
-COPY logline_server ./logline_server
+COPY src ./src
 RUN uv sync --frozen --no-dev
 
 ENV PATH="/src/.venv/bin:$PATH"
