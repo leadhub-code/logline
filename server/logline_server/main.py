@@ -26,7 +26,7 @@ def server_main():
     p.add_argument('--bind')
     p.add_argument('--reuse-port', action='store_true',
         help='set SO_REUSEPORT so multiple server instances can listen on the same '
-             'address for load balancing by the kernel (Linux)')
+             'address for load balancing by the kernel (where supported)')
     p.add_argument('--dest', help='directory to store the received logs')
     p.add_argument('--tls-cert', help='path to the file with certificate in PEM format')
     p.add_argument('--tls-key', help='path to the file with key in PEM format')
