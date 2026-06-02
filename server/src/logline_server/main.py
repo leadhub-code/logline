@@ -6,14 +6,17 @@ from functools import partial
 import gzip
 from hashlib import sha1
 from io import SEEK_END
-import json
 from logging import DEBUG, ERROR, INFO, Formatter, StreamHandler, getLogger
 from logging.handlers import WatchedFileHandler
 import lzma
 from reprlib import repr as smart_repr
 from ssl import Purpose, create_default_context
 
+from msgspec import MsgspecError
+from msgspec.json import decode, encode
+
 from .configuration import Configuration
+from .protocol import DataMeta, Header, OkLengthReply
 from .util import decompress_zst
 
 
@@ -108,17 +111,12 @@ async def handle_client(conf, reader, writer):
             return
         if command != 'logline-agent-v1' or data:
             raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
-        header = metadata
-        if not isinstance(header, dict):
-            raise ProtocolError(f'Expected a JSON object as header, received {smart_repr(header)}')
-        for field in ('hostname', 'path', 'prefix', 'auth'):
-            if not header.get(field):
-                raise ProtocolError(f'Missing required header field: {field}')
+        header = decode_message(metadata, Header)
 
-        check_client_auth(conf, header['auth'])
+        check_client_auth(conf, header.auth)
 
         dst_path = build_destination_path(
-            conf.destination_directory, header['hostname'], header['path'])
+            conf.destination_directory, header.hostname, header.path)
 
         if not dst_path.parent.is_dir():
             if not dst_path.parent.parent.is_dir():
@@ -134,8 +132,8 @@ async def handle_client(conf, reader, writer):
             logger.debug('File does not exist yet: %s', dst_path)
         else:
             assert f.tell() == 0
-            f_prefix = f.read(header['prefix']['length'])
-            if f_prefix and sha1_b64(f_prefix) == header['prefix']['sha1']:
+            f_prefix = f.read(header.prefix.length)
+            if f_prefix and sha1_b64(f_prefix) == header.prefix.sha1:
                 # it's the correct file :)
                 logger.info('File has the correct prefix: %s', dst_path)
             else:
@@ -153,7 +151,7 @@ async def handle_client(conf, reader, writer):
         f.seek(0, SEEK_END)
         f_length = f.tell()
 
-        await send_reply(writer, 'ok', {'length': f_length})
+        await send_reply(writer, 'ok', OkLengthReply(length=f_length))
 
         while True:
             command, metadata, data = await recv_command(reader)
@@ -161,17 +159,17 @@ async def handle_client(conf, reader, writer):
                 raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
             if not isinstance(data, bytes):
                 raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
-            if metadata.get('compression') == 'gzip':
+            meta = decode_message(metadata, DataMeta)
+            if meta.compression == 'gzip':
                 data = await to_thread(gzip.decompress, data)
-            elif metadata.get('compression') == 'lzma':
+            elif meta.compression == 'lzma':
                 data = await to_thread(lzma.decompress, data)
-            elif metadata.get('compression') == 'zst':
+            elif meta.compression == 'zst':
                 data = await decompress_zst(data)
-            elif metadata.get('compression') is not None:
-                raise Exception(f"Unsupported compression method: {metadata['compression']}")
-            offset = metadata.get('offset')
-            if offset != f.tell():
-                raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
+            elif meta.compression is not None:
+                raise Exception(f"Unsupported compression method: {meta.compression}")
+            if meta.offset != f.tell():
+                raise ProtocolError(f'Unexpected data offset: client sent {meta.offset}, expected {f.tell()}')
             logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
             f.write(data)
             f.flush()
@@ -244,15 +242,13 @@ def build_destination_path(destination_directory, hostname, path):
 
 
 def check_client_auth(conf, header_auth):
-    if not header_auth:
-        raise Exception('No auth info received in header')
-    if header_auth.get('client_token'):
-        ct_bytes = header_auth['client_token'].encode('utf-8')
-        if sha1_hex(ct_bytes) in conf.client_token_hashes:
-            logger.debug('Client token verified with SHA1 hash %s', sha1_hex(ct_bytes))
-            return
-        raise Exception(f'Unknown client token; hash: {sha1_hex(ct_bytes)}')
-    raise Exception('Client token was not received in header')
+    if not header_auth.client_token:
+        raise Exception('Client token was not received in header')
+    ct_bytes = header_auth.client_token.encode('utf-8')
+    if sha1_hex(ct_bytes) in conf.client_token_hashes:
+        logger.debug('Client token verified with SHA1 hash %s', sha1_hex(ct_bytes))
+        return
+    raise Exception(f'Unknown client token; hash: {sha1_hex(ct_bytes)}')
 
 
 class ConnectionClosed (Exception):
@@ -265,6 +261,19 @@ class ProtocolError (Exception):
 
 class ReceivedHTTPRequestError (ProtocolError):
     pass
+
+
+def decode_message(raw, message_type):
+    '''
+    Decode JSON metadata received from the client into the given msgspec
+    model, turning any decoding or validation failure into a ProtocolError.
+    '''
+    if not isinstance(raw, bytes):
+        raise ProtocolError(f'Expected {message_type.__name__} metadata, received none')
+    try:
+        return decode(raw, type=message_type)
+    except MsgspecError as e:
+        raise ProtocolError(f'Invalid {message_type.__name__} message: {e}')
 
 
 async def recv_command(reader, first=False):
@@ -295,18 +304,20 @@ async def recv_command(reader, first=False):
     else:
         raise ProtocolError(f"Failed to parse command line: {smart_repr(line)}")
     metadata_bytes = await reader.readexactly(metadata_size)
-    metadata = json.loads(metadata_bytes)
     if data_size is None:
         data = None
     elif data_size == 0:
         data = b''
     else:
         data = await reader.readexactly(data_size)
+    # The metadata bytes are intentionally not parsed or logged here: the caller
+    # decodes them into a typed model, and the header metadata carries the
+    # client token, which must not be written to the logs.
     if data is None:
-        logger.debug('Received %s %r', command, metadata)
+        logger.debug('Received %s (%d B metadata)', command, len(metadata_bytes))
     else:
-        logger.debug('Received %s %r + %d B data', command, metadata, len(data))
-    return command, metadata, data
+        logger.debug('Received %s (%d B metadata) + %d B data', command, len(metadata_bytes), len(data))
+    return command, metadata_bytes, data
 
 
 async def send_reply(writer, status, payload):
@@ -315,7 +326,7 @@ async def send_reply(writer, status, payload):
         writer.write(f'{status}\n'.encode('ascii'))
         logger.debug('Sent reply %s -', status)
     else:
-        payload_bytes = json.dumps(payload).encode('utf-8')
+        payload_bytes = encode(payload)
         writer.write(f'{status} {len(payload_bytes)}\n'.encode('ascii'))
         writer.write(payload_bytes)
         logger.debug('Sent reply %s %r', status, payload)
