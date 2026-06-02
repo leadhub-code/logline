@@ -16,6 +16,7 @@ test:
 lint:
 	$(MAKE) -C agent lint
 	$(MAKE) -C server lint
+	$(MAKE) -C e2e_tests lint
 
 # Build the server container image.
 image:
