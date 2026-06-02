@@ -97,7 +97,6 @@ async def create_server(conf):
         partial(handle_client, conf),
         conf.bind_host, conf.bind_port,
         ssl=ssl_context,
-        reuse_address=True,
         reuse_port=conf.reuse_port)
 
 
