@@ -1,8 +1,13 @@
 FROM python:3.9-slim
 
-COPY logline_server /src/logline_server
-COPY pyproject.toml setup.cfg setup.py /src/
+COPY --from=ghcr.io/astral-sh/uv:0.11.18 /uv /uvx /bin/
 
-RUN pip install /src
+WORKDIR /src
+COPY pyproject.toml uv.lock README.md ./
+COPY logline_server ./logline_server
+
+RUN uv sync --frozen --no-dev
+
+ENV PATH="/src/.venv/bin:$PATH"
 
 ENTRYPOINT ["logline-server"]

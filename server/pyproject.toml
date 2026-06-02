@@ -1,6 +1,32 @@
-[build-system]
-requires = [
-    "setuptools>=42",
-    "wheel"
+[project]
+name = "logline-server"
+version = "0.0.1"
+description = "Logline Server"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
 ]
-build-backend = "setuptools.build_meta"
+dependencies = [
+    "pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/messa/logline"
+
+[project.scripts]
+logline-server = "logline_server:server_main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["logline_server"]
