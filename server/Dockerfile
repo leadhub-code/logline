@@ -1,11 +1,17 @@
-FROM python:3.9-slim
+FROM python:3.14
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.18 /uv /uvx /bin/
 
 WORKDIR /src
-COPY pyproject.toml uv.lock README.md ./
-COPY logline_server ./logline_server
 
+# Install dependencies first, in their own layer, so changing the source does
+# not invalidate the cached dependency install.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Then copy the source and install the project itself.
+COPY README.md ./
+COPY logline_server ./logline_server
 RUN uv sync --frozen --no-dev
 
 ENV PATH="/src/.venv/bin:$PATH"
