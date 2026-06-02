@@ -27,12 +27,15 @@ class ClientError (Exception):
     pass
 
 
-async def connect_to_server(conf, log_path, log_prefix):
+async def connect_to_server(conf, log_path, target, log_prefix):
     '''
     Connect to the server specified in the configuration.
-    Initial header is sent to the server, containing some metadata and log file prefix.
+
+    Initial header is sent to the server, containing some metadata, the explicit
+    agent-chosen ``target`` filename to write into, and the log file prefix.
     '''
     assert isinstance(log_prefix, bytes)
+    assert isinstance(target, str)
     assert isinstance(conf.client_token, str)
     logger.debug('Connecting to %s:%s', conf.server_host, conf.server_port)
     if conf.use_tls:
@@ -49,6 +52,7 @@ async def connect_to_server(conf, log_path, log_prefix):
     await cc.send_header({
         'hostname': getfqdn(),
         'path': str(log_path),
+        'target': target,
         'prefix': {
             'length': len(log_prefix),
             'sha1': sha1_b64(log_prefix),
@@ -89,6 +93,17 @@ class ClientConnection:
             metadata['compression'] = 'gzip'
             content = content_gz
         await self._send_command('data', metadata, content)
+
+    async def send_rename(self, src, dst):
+        '''
+        Ask the server to rename ``src`` to ``dst`` within this connection's
+        directory. The frame is idempotent server-side, so it is safe to replay.
+        The open fd on the server survives the rename, so appends may continue
+        afterwards into the renamed file.
+        '''
+        assert isinstance(src, str)
+        assert isinstance(dst, str)
+        await self._send_command('rename', {'from': src, 'to': dst})
 
     async def _send_command(self, command, metadata, data=None):
         assert isinstance(command, str)
