@@ -49,6 +49,8 @@ class Configuration:
         else:
             self.bind_host, self.bind_port = '', self.default_port
 
+        self.reuse_port = bool(args.reuse_port or cfg.get('reuse_port'))
+
         if args.dest:
             self.destination_directory = Path(args.dest)
         elif cfg.get('dest'):

@@ -11,7 +11,7 @@ from logging import getLogger
 import lzma
 from reprlib import repr as smart_repr
 
-from .configuration import Configuration
+from .configuration import Configuration, ConfigurationError
 from .util import to_thread, decompress_zst
 
 
@@ -24,6 +24,9 @@ def server_main():
     p.add_argument('--log', help='path to log file')
     p.add_argument('--verbose', '-v', action='store_true')
     p.add_argument('--bind')
+    p.add_argument('--reuse-port', action='store_true',
+        help='set SO_REUSEPORT so multiple server instances can listen on the same '
+             'address for load balancing by the kernel (Linux)')
     p.add_argument('--dest', help='directory to store the received logs')
     p.add_argument('--tls-cert', help='path to the file with certificate in PEM format')
     p.add_argument('--tls-key', help='path to the file with key in PEM format')
@@ -68,6 +71,13 @@ def setup_log_file(log_file_path):
 
 
 async def async_main(conf):
+    server = await create_server(conf)
+    logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
+    async with server:
+        await server.serve_forever()
+
+
+async def create_server(conf):
     if conf.use_tls:
         from ssl import create_default_context, Purpose
         ssl_context = create_default_context(purpose=Purpose.CLIENT_AUTH)
@@ -78,13 +88,17 @@ async def async_main(conf):
             password=conf.tls_password)
     else:
         ssl_context = None
-    server = await start_server(
+    if conf.reuse_port:
+        try:
+            from socket import SO_REUSEPORT  # noqa: F401
+        except ImportError:
+            raise ConfigurationError('--reuse-port was requested but SO_REUSEPORT is not supported on this platform')
+    return await start_server(
         partial(handle_client, conf),
         conf.bind_host, conf.bind_port,
-        ssl=ssl_context)
-    logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
-    async with server:
-        await server.serve_forever()
+        ssl=ssl_context,
+        reuse_address=True,
+        reuse_port=conf.reuse_port)
 
 
 async def handle_client(conf, reader, writer):

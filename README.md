@@ -11,3 +11,12 @@ Consists of two pieces:
 - **server** listens on a TCP port, receives data from agents and manages a mirror of the log files processed by agents
 
 The TCP connection can be encrypted via SSL/TLS – using a certificate for example from LetsEncrypt.org or a self-signed one.
+
+Scaling the server
+------------------
+
+A single server instance is single-threaded. To use more CPU cores you can run
+multiple instances listening on the same address by passing the `--reuse-port`
+option (which sets the `SO_REUSEPORT` socket option, available on Linux). The
+kernel then load-balances incoming connections across all instances. In Docker,
+run the instances with `--network=host` so they share the host's network stack.
