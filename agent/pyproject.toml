@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/messa/logline"
+Homepage = "https://github.com/leadhub-code/logline"
 
 [project.scripts]
 logline-agent = "logline_agent:agent_main"
