@@ -4,12 +4,14 @@ from base64 import b64encode
 from datetime import datetime
 from functools import partial
 import gzip
-import hashlib
+from hashlib import sha1
 from io import SEEK_END
 import json
-from logging import getLogger
+from logging import DEBUG, ERROR, INFO, Formatter, StreamHandler, getLogger
+from logging.handlers import WatchedFileHandler
 import lzma
 from reprlib import repr as smart_repr
+from ssl import Purpose, create_default_context
 
 from .configuration import Configuration
 from .util import decompress_zst, to_thread
@@ -43,7 +45,6 @@ stderr_log_handler = None
 
 def setup_logging(verbose):
     global stderr_log_handler
-    from logging import DEBUG, INFO, Formatter, StreamHandler, getLogger
     h = StreamHandler()
     h.setFormatter(Formatter(log_format))
     h.setLevel(DEBUG if verbose else INFO)
@@ -53,8 +54,6 @@ def setup_logging(verbose):
 
 
 def setup_log_file(log_file_path):
-    from logging import DEBUG, ERROR, INFO, Formatter, getLogger
-    from logging.handlers import WatchedFileHandler
     if not log_file_path:
         return
     h = WatchedFileHandler(str(log_file_path))
@@ -69,7 +68,6 @@ def setup_log_file(log_file_path):
 
 async def async_main(conf):
     if conf.use_tls:
-        from ssl import Purpose, create_default_context
         ssl_context = create_default_context(purpose=Purpose.CLIENT_AUTH)
         logger.debug('Using TLS; certfile: %s keyfile: %s', conf.tls_cert_file, conf.tls_key_file)
         ssl_context.load_cert_chain(
@@ -311,14 +309,14 @@ async def send_reply(writer, status, payload):
 
 
 def sha1_b64(data):
-    return b64encode(hashlib.sha1(data).digest()).decode('ascii')
+    return b64encode(sha1(data).digest()).decode('ascii')
 
 
 assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
 
 
 def sha1_hex(data):
-    return hashlib.sha1(data).hexdigest()
+    return sha1(data).hexdigest()
 
 
 assert sha1_hex(b'hello') == 'aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d'

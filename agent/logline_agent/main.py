@@ -2,7 +2,8 @@ from argparse import ArgumentParser
 from asyncio import sleep
 from functools import partial
 from glob import glob
-from logging import getLogger
+from logging import DEBUG, ERROR, INFO, Formatter, StreamHandler, getLogger
+from logging.handlers import WatchedFileHandler
 from os import fstat
 from pathlib import Path
 from time import monotonic as monotime
@@ -53,7 +54,6 @@ stderr_log_handler = None
 
 def setup_logging(verbose):
     global stderr_log_handler
-    from logging import DEBUG, INFO, Formatter, StreamHandler, getLogger
     h = StreamHandler()
     h.setFormatter(Formatter(log_format))
     h.setLevel(DEBUG if verbose else INFO)
@@ -63,8 +63,6 @@ def setup_logging(verbose):
 
 
 def setup_log_file(log_file_path):
-    from logging import DEBUG, ERROR, INFO, Formatter, getLogger
-    from logging.handlers import WatchedFileHandler
     if not log_file_path:
         return
     h = WatchedFileHandler(str(log_file_path))

@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import re
 
+import yaml
+
 
 logger = getLogger(__name__)
 
@@ -22,7 +24,6 @@ class Configuration:
         if args.conf:
             cfg_path = Path(args.conf)
             cfg_dir = cfg_path.parent
-            import yaml
             cfg = yaml.safe_load(cfg_path.read_text())
         else:
             cfg = {}
