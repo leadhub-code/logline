@@ -62,7 +62,8 @@ class Sink:
 
     def write(self, offset, data):
         '''
-        Append the part of data that lies beyond the current end of file.
+        Append the part of data that lies beyond the current end of file, and
+        flush it out of the process buffer so a reader sees it immediately.
         Returns the number of bytes actually written.
         '''
         if offset > self._length:
@@ -72,16 +73,18 @@ class Sink:
             return 0  # fully duplicate, already stored
         skip = self._length - offset
         written = self._f.write(data[skip:])
+        self._f.flush()
         self._length = end
         return written
 
-    def flush(self):
-        self._f.flush()
+    def sync(self):
+        '''Force the data durably to disk, if fsync is enabled.'''
         if self._fsync_each_flush:
             fsync(self._f.fileno())
 
     def close(self):
         try:
-            self.flush()
+            self._f.flush()
+            self.sync()
         finally:
             self._f.close()

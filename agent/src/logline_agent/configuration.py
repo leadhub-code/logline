@@ -11,21 +11,30 @@ logger = getLogger(__name__)
 
 class ConfigurationError (Exception):
     '''
-    This exception means that some user input is missing.
+    This exception means that some user input is missing or invalid.
     '''
 
 
 class Configuration:
     '''
-    LogLine Agent configuration
+    Logline Agent configuration
     '''
+
+    default_port = 5645
 
     def __init__(self, args):
         if args.conf:
             cfg_path = Path(args.conf)
-            cfg_dir = cfg_path.parent
-            cfg = yaml.safe_load(cfg_path.read_text())
+        elif os.environ.get('CONF_FILE'):
+            cfg_path = Path(os.environ['CONF_FILE'])
         else:
+            cfg_path = None
+
+        if cfg_path:
+            cfg_dir = cfg_path.parent
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
+        else:
+            cfg_dir = None
             cfg = {}
 
         if args.log:
@@ -41,21 +50,11 @@ class Configuration:
         if cfg.get('scan'):
             assert isinstance(cfg['scan'], list)
             self.scan_globs.extend(cfg['scan'])
-        logger.debug('scan_globs: %r', self.scan_globs)
         if not self.scan_globs:
             raise ConfigurationError('No log sources were configured')
 
-        self.exclude_globs = []
-        if cfg.get('exclude'):
-            assert isinstance(cfg['exclude'], list)
-            self.exclude_globs.extend(cfg['exclude'])
-        logger.debug('exclude_globs: %r', self.exclude_globs)
-
-        self.exclude_if_file_present = []
-        if cfg.get('exclude_if_file_present'):
-            assert isinstance(cfg['exclude_if_file_present'], list)
-            self.exclude_if_file_present.extend(cfg['exclude_if_file_present'])
-        logger.debug('exclude_if_file_present: %r', self.exclude_if_file_present)
+        self.exclude_globs = list(cfg.get('exclude') or [])
+        self.exclude_if_file_present = list(cfg.get('exclude_if_file_present') or [])
 
         if args.server:
             self.server_host, self.server_port = parse_address(args.server)
@@ -72,12 +71,13 @@ class Configuration:
             self.tls_cert_file = None
 
         if self.tls_cert_file and not self.tls_cert_file.is_file():
-            raise ConfigurationError('TLS cert is not a file: {}'.format(self.tls_cert_file))
+            raise ConfigurationError(f'TLS cert is not a file: {self.tls_cert_file}')
 
-        self.use_tls = args.tls \
-            or self.tls_cert_file \
-            or cfg.get('tls', {}).get('enable') \
-            or cfg.get('tls', {}).get('enabled')
+        self.use_tls = bool(
+            args.tls
+            or self.tls_cert_file
+            or cfg.get('tls', {}).get('enable')
+            or cfg.get('tls', {}).get('enabled'))
 
         if args.token_file:
             self.client_token = Path(args.token_file).read_text().strip()
@@ -90,13 +90,31 @@ class Configuration:
         else:
             raise ConfigurationError('Client token is not configured')
 
-        self.prefix_length = 50 # in bytes
-        self.min_prefix_length = 20 # in bytes
+        # File identity: the prefix is the first bytes of a file plus their
+        # SHA-256, used by the server to detect rotation. We start streaming as
+        # soon as the file has any content; the prefix is whatever is there, up
+        # to prefix_size bytes.
+        self.prefix_size = 256
+        self.min_prefix_size = 1
 
-        # All these intervals are in seconds (int or float)
-        self.tail_read_interval = 1
-        self.scan_new_files_interval = 1
-        self.rotated_files_inactivity_threshold = 600
+        # Tuning. Override via the "tuning" section of the YAML config.
+        tuning = cfg.get('tuning') or {}
+        self.chunk_size = int(tuning.get('chunk_size', 256 * 1024))
+        self.window_bytes = int(tuning.get('window_bytes', 4 * 1024 * 1024))
+        self.max_frame_size = int(tuning.get('max_frame_size', 4 * 1024 * 1024))
+        self.tail_read_interval = float(tuning.get('tail_read_interval', 1))
+        self.scan_interval = float(tuning.get('scan_interval', 1))
+        self.heartbeat_interval = float(tuning.get('heartbeat_interval', 30))
+        self.idle_timeout = float(tuning.get('idle_timeout', 120))
+        self.connect_timeout = float(tuning.get('connect_timeout', 30))
+        self.reconnect_interval = float(tuning.get('reconnect_interval', 5))
+        self.rotated_files_inactivity_threshold = float(tuning.get('rotated_files_inactivity_threshold', 600))
+
+        # Compression of DATA bodies. One of: none, gzip, deflate (all stdlib).
+        self.codec = tuning.get('codec', 'gzip')
+        if self.codec not in ('none', 'gzip', 'deflate'):
+            raise ConfigurationError(f'Unsupported codec: {self.codec!r}')
+        self.min_compress_size = int(tuning.get('min_compress_size', 256))
 
 
 def parse_address(s):
@@ -108,4 +126,4 @@ def parse_address(s):
     if m:
         port, = m.groups()
         return '', int(port)
-    raise Exception('Unknown address format: {}'.format(s))
+    raise ConfigurationError(f'Unknown address format: {s}')

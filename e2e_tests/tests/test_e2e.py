@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from hashlib import sha1
+from hashlib import sha256
 from logging import getLogger
 import os
 from os import chdir
@@ -14,7 +14,7 @@ logger = getLogger(__name__)
 
 
 client_token = 'topsecret'
-client_token_hash = sha1(client_token.encode()).hexdigest()
+client_token_hash = sha256(client_token.encode()).hexdigest()
 
 
 def test_run_agent_help():

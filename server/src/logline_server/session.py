@@ -183,7 +183,7 @@ class ServerSession:
     def _ack_stream(self, stream_id, sink):
         if sink.offset == self.acked.get(stream_id):
             return
-        sink.flush()  # only ACK what is durably stored
+        sink.sync()  # only ACK what is durably stored (fsync if enabled)
         self.acked[stream_id] = sink.offset
         self._enqueue_control(ACK, stream_id, Ack(offset=sink.offset))
 
