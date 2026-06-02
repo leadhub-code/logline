@@ -69,7 +69,7 @@ class Configuration:
         if args.tls_key:
             self.tls_key_file = args.tls_key
         elif cfg.get('tls', {}).get('key'):
-            self.tls_key_file = cfg['tls']['key']
+            self.tls_key_file = cfg_dir / cfg['tls']['key']
         else:
             self.tls_key_file = None
 
