@@ -9,8 +9,10 @@ WORKDIR /src
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-# Then copy the source and install the project itself.
-COPY README.md ./
+# Then copy the source and install the project itself. LICENSE is required
+# because pyproject declares license-files = ["LICENSE"], which uv_build
+# validates while building the project.
+COPY README.md LICENSE ./
 COPY logline_server ./logline_server
 RUN uv sync --frozen --no-dev
 
