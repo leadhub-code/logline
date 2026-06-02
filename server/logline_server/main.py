@@ -1,5 +1,5 @@
 from argparse import ArgumentParser
-from asyncio import run, start_server
+from asyncio import run, start_server, to_thread
 from base64 import b64encode
 from datetime import datetime
 from functools import partial
@@ -14,7 +14,7 @@ from reprlib import repr as smart_repr
 from ssl import Purpose, create_default_context
 
 from .configuration import Configuration
-from .util import decompress_zst, to_thread
+from .util import decompress_zst
 
 
 logger = getLogger(__name__)

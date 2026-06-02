@@ -2,7 +2,7 @@
 Client for the Logline Server
 '''
 
-from asyncio import open_connection, wait_for
+from asyncio import open_connection, to_thread, wait_for
 from base64 import b64encode
 import gzip
 from hashlib import sha1
@@ -12,8 +12,6 @@ import re
 from socket import getfqdn
 from ssl import Purpose, create_default_context
 from time import monotonic as monotime
-
-from .asyncio_helpers import to_thread
 
 
 logger = getLogger(__name__)
