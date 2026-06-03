@@ -1,0 +1,21 @@
+[project]
+name = "logline-e2e-tests"
+version = "0.0.1"
+description = "Logline end-to-end tests"
+requires-python = ">=3.9"
+dependencies = [
+    "logline-agent",
+    "logline-server",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+logline-agent = { path = "../agent", editable = true }
+logline-server = { path = "../server", editable = true }

@@ -1,5 +1,6 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
+# This workflow installs the agent and server with uv and runs the end-to-end
+# test suite across a range of Python versions.
+# For more information see: https://docs.astral.sh/uv/guides/integration/github/
 
 name: E2E tests
 
@@ -24,20 +25,11 @@ jobs:
 
     steps:
     - uses: actions/checkout@v6
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v6
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip wheel
-        python -m pip install pytest
-    - name: Install Logline Agent
-      run: |
-        python -m pip install ./agent
-    - name: Install Logline Server
-      run: |
-        python -m pip install ./server
     - name: Test with pytest
       run: |
-        pytest -v --tb=native -p no:logging e2e_tests
+        cd e2e_tests
+        uv run --frozen pytest -v --tb=native -p no:logging tests
