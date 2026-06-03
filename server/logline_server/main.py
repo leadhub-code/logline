@@ -13,7 +13,7 @@ import lzma
 from reprlib import repr as smart_repr
 from ssl import Purpose, create_default_context
 
-from .configuration import Configuration
+from .configuration import Configuration, ConfigurationError
 from .util import decompress_zst
 
 

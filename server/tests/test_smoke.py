@@ -1,4 +1,4 @@
-from subprocess import check_call, DEVNULL
+from subprocess import DEVNULL, check_call
 import sys
 
 
