@@ -246,6 +246,10 @@ def build_destination_path(destination_directory, hostname, path):
     untrusted) client, so they must never be allowed to escape the configured
     destination directory via path traversal.
     '''
+    if not isinstance(hostname, str):
+        raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
+    if not isinstance(path, str):
+        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
     if not _is_safe_path_segment(hostname):
         raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
 

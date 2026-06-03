@@ -110,6 +110,20 @@ def test_non_dict_header_is_rejected(tmp_path):
     assert not dst_file(tmp_path).exists()
 
 
+def test_non_string_hostname_is_rejected(tmp_path):
+    conf = make_conf(tmp_path)
+    writer = drive(conf, frame('logline-agent-v1', valid_header(hostname=123)))
+    assert b'ok' not in writer.buffer
+    assert not dst_file(tmp_path).exists()
+
+
+def test_non_string_path_is_rejected(tmp_path):
+    conf = make_conf(tmp_path)
+    writer = drive(conf, frame('logline-agent-v1', valid_header(path=['/var/log/app.log'])))
+    assert b'ok' not in writer.buffer
+    assert not dst_file(tmp_path).exists()
+
+
 def test_non_dict_prefix_is_rejected(tmp_path):
     conf = make_conf(tmp_path)
     writer = drive(conf, frame('logline-agent-v1', valid_header(prefix='not-a-dict')))
