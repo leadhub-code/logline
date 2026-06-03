@@ -128,7 +128,20 @@ async def handle_client(conf, reader, writer):
             if not header.get(field):
                 raise ProtocolError(f'Missing required header field: {field}')
 
-        check_client_auth(conf, header['auth'])
+        prefix = header['prefix']
+        if not isinstance(prefix, dict):
+            raise ProtocolError(f'Expected a JSON object as prefix, received {smart_repr(prefix)}')
+        prefix_length = prefix.get('length')
+        if not isinstance(prefix_length, int) or isinstance(prefix_length, bool) or prefix_length < 0:
+            raise ProtocolError(f'Invalid prefix length: {smart_repr(prefix_length)}')
+        prefix_sha1 = prefix.get('sha1')
+        if not isinstance(prefix_sha1, str):
+            raise ProtocolError(f'Invalid prefix sha1: {smart_repr(prefix_sha1)}')
+
+        auth = header['auth']
+        if not isinstance(auth, dict):
+            raise ProtocolError(f'Expected a JSON object as auth, received {smart_repr(auth)}')
+        check_client_auth(conf, auth)
 
         dst_path = build_destination_path(
             conf.destination_directory, header['hostname'], header['path'])
@@ -147,8 +160,8 @@ async def handle_client(conf, reader, writer):
             logger.debug('File does not exist yet: %s', dst_path)
         else:
             assert f.tell() == 0
-            f_prefix = f.read(header['prefix']['length'])
-            if f_prefix and sha1_b64(f_prefix) == header['prefix']['sha1']:
+            f_prefix = f.read(prefix_length)
+            if f_prefix and sha1_b64(f_prefix) == prefix_sha1:
                 # it's the correct file :)
                 logger.info('File has the correct prefix: %s', dst_path)
             else:
@@ -174,6 +187,8 @@ async def handle_client(conf, reader, writer):
                 raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
             if not isinstance(data, bytes):
                 raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
+            if not isinstance(metadata, dict):
+                raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
             if metadata.get('compression') == 'gzip':
                 data = await to_thread(gzip.decompress, data)
             elif metadata.get('compression') == 'lzma':
@@ -183,6 +198,8 @@ async def handle_client(conf, reader, writer):
             elif metadata.get('compression') is not None:
                 raise Exception(f"Unsupported compression method: {metadata['compression']}")
             offset = metadata.get('offset')
+            if not isinstance(offset, int) or isinstance(offset, bool):
+                raise ProtocolError(f'Invalid data offset: {smart_repr(offset)}')
             if offset != f.tell():
                 raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
             logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
@@ -259,8 +276,11 @@ def build_destination_path(destination_directory, hostname, path):
 def check_client_auth(conf, header_auth):
     if not header_auth:
         raise Exception('No auth info received in header')
-    if header_auth.get('client_token'):
-        ct_bytes = header_auth['client_token'].encode('utf-8')
+    client_token = header_auth.get('client_token')
+    if client_token:
+        if not isinstance(client_token, str):
+            raise ProtocolError(f'Invalid client token: {smart_repr(client_token)}')
+        ct_bytes = client_token.encode('utf-8')
         if sha1_hex(ct_bytes) in conf.client_token_hashes:
             logger.debug('Client token verified with SHA1 hash %s', sha1_hex(ct_bytes))
             return
