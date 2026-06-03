@@ -35,7 +35,7 @@ def agent_main():
     setup_log_file(conf.log_file)
     logger.info('Logline Agent starting')
     try:
-        run(async_main(conf), debug=True)
+        run(async_main(conf))
     except Exception as e:
         logger.exception('Logline Agent failed: %r', e)
     except BaseException as e:
