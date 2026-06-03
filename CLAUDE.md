@@ -12,6 +12,18 @@ repository or in public-facing places in **English**:
 (Conversational replies to the maintainer may be in their language, but
 anything committed or published must be English.)
 
+## Python code style
+
+Linting is done with [ruff](https://docs.astral.sh/ruff/). The configuration
+lives in each component's `pyproject.toml` (`agent`, `server`, `e2e_tests`).
+Run `make lint` (or `make check`) to lint the whole repository.
+
+- Maximum line length is 150 characters.
+- Keep two blank lines between the import block and the code that follows it
+  (enforced via ruff's isort `lines-after-imports`).
+- Prefer `from X import Y` over `import X` where it reads naturally. This is a
+  convention only; ruff has no rule for it.
+
 # Agent workflow
 
 When you finish a coherent unit of work (a task, or a change you would

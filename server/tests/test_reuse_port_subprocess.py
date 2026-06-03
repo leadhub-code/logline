@@ -9,9 +9,9 @@ sleeping for a fixed amount of time.
 '''
 
 from logging import getLogger
-from queue import Queue, Empty
+from queue import Empty, Queue
 import socket
-from subprocess import Popen, PIPE, TimeoutExpired
+from subprocess import PIPE, Popen, TimeoutExpired
 import sys
 import threading
 from time import monotonic as monotime

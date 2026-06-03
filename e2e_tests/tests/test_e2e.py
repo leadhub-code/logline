@@ -1,22 +1,20 @@
 from contextlib import ExitStack
-import hashlib
+from hashlib import sha1
 from logging import getLogger
 import os
 from os import chdir
 from pathlib import Path
-from pytest import skip
 from socket import getfqdn
 from subprocess import Popen, check_call
-import sys
-from time import sleep
 from time import monotonic as monotime
+from time import sleep
 
 
 logger = getLogger(__name__)
 
 
 client_token = 'topsecret'
-client_token_hash = hashlib.sha1(client_token.encode()).hexdigest()
+client_token_hash = sha1(client_token.encode()).hexdigest()
 
 
 def test_run_agent_help():
@@ -169,7 +167,7 @@ def test_new_log_file_gets_copied(tmp_path):
         assert agent_process.poll() is None
         assert server_process.poll() is None
         assert expected_dst_first_file.exists()
-        assert expected_dst_second_file.exists() == False
+        assert not expected_dst_second_file.exists()
         Path('agent-src/second.log').write_text('2021-02-22 17:00:10 Second file\n')
         t0 = monotime()
         while True:

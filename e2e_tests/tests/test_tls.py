@@ -1,23 +1,21 @@
 from contextlib import ExitStack
-import hashlib
+from hashlib import sha1
 from logging import getLogger
 import os
 from os import chdir
 from pathlib import Path
-from pytest import skip
 from socket import getfqdn
 from subprocess import Popen, check_call
-import sys
 from textwrap import dedent
-from time import sleep
 from time import monotonic as monotime
+from time import sleep
 
 
 logger = getLogger(__name__)
 
 
 client_token = 'topsecret'
-client_token_hash = hashlib.sha1(client_token.encode()).hexdigest()
+client_token_hash = sha1(client_token.encode()).hexdigest()
 
 
 selfsigned_cert_pem = dedent('''\

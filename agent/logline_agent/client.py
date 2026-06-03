@@ -2,17 +2,16 @@
 Client for the Logline Server
 '''
 
-from asyncio import open_connection, wait_for
+from asyncio import open_connection, to_thread, wait_for
 from base64 import b64encode
 import gzip
+from hashlib import sha1
+import json
 from logging import getLogger
 import re
-from reprlib import repr as smart_repr
 from socket import getfqdn
+from ssl import Purpose, create_default_context
 from time import monotonic as monotime
-import json
-
-from .asyncio_helpers import to_thread
 
 
 logger = getLogger(__name__)
@@ -33,7 +32,6 @@ async def connect_to_server(conf, log_path, log_prefix):
     assert isinstance(conf.client_token, str)
     logger.debug('Connecting to %s:%s', conf.server_host, conf.server_port)
     if conf.use_tls:
-        from ssl import create_default_context, Purpose
         logger.debug('Using TLS; cafile: %s', conf.tls_cert_file or '-')
         ssl_context = create_default_context(
             purpose=Purpose.SERVER_AUTH,
@@ -132,9 +130,8 @@ class ClientConnection:
 
 
 def sha1_b64(data):
-    import hashlib
     assert isinstance(data, bytes)
-    return b64encode(hashlib.sha1(data).digest()).decode('ascii')
+    return b64encode(sha1(data).digest()).decode('ascii')
 
 
 assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
@@ -142,7 +139,7 @@ assert sha1_b64(b'hello') == 'qvTGHdzF6KLavt4PO0gs2a6pQ00='
 
 def obfuscate_secrets(json_str):
     assert isinstance(json_str, str)
-    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, re.ASCII)
+    json_str = re.sub(r'("client_token":\s+"[^"]{2})([^"]+)([^"]{2}")', r'\1...\3', json_str, flags=re.ASCII)
     return json_str
 
 

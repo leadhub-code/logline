@@ -1,3 +1,4 @@
+from logging import DEBUG, basicConfig
 import os
 from pathlib import Path
 import sys
@@ -11,7 +12,6 @@ def pytest_configure(config):
         os.environ['PATH'] = f"{bin_path}:{os.environ['PATH']}"
         print('PATH modified to:', os.environ['PATH'])
 
-    from logging import basicConfig, DEBUG
     basicConfig(
         format='%(asctime)s [pytest %(process)d] %(name)s %(levelname)5s: %(message)s',
         level=DEBUG)
