@@ -35,4 +35,4 @@ jobs:
     - name: Test with pytest
       run: |
         cd e2e_tests
-        uv run pytest -v --tb=native -p no:logging tests
+        uv run --frozen pytest -v --tb=native -p no:logging tests
