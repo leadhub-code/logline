@@ -1,6 +1,6 @@
 '''
-Integration tests for the agent rotation coordinator (PLAN_v2), driving the real
-``PathCoordinator`` against the real in-process v2 server over a loopback socket.
+Integration tests for the agent rotation coordinator, driving the real
+``PathCoordinator`` against the real in-process server over a loopback socket.
 
 A rotation is simulated the way lh-logrotate performs it: the old inode is
 renamed aside (the agent's open fd follows it), a fresh file is created under the

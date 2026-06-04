@@ -1,7 +1,6 @@
 from argparse import ArgumentParser
 from asyncio import TimeoutError, run, start_server, to_thread, wait_for
 from base64 import b64encode
-from datetime import datetime, timezone
 from functools import partial
 import gzip
 from hashlib import sha1
@@ -153,16 +152,10 @@ async def handle_client(conf, reader, writer):
             logger.debug('Creating directory: %s', dst_path.parent)
             dst_path.parent.mkdir()
 
-        if header.get('target') is None:
-            # Legacy agent (no explicit target): keep the old content-based
-            # rotate-on-prefix-mismatch behaviour so a v2 server can be deployed
-            # ahead of the agent without breaking older agents.
-            await serve_legacy(conf, reader, writer, dst_path, prefix_length, prefix_sha1)
-        else:
-            target = header['target']
-            if not isinstance(target, str) or not _is_safe_path_segment(target):
-                raise ProtocolError(f'Invalid target: {smart_repr(target)}')
-            await serve_v2(conf, reader, writer, dst_path.parent, target, prefix_length)
+        target = header.get('target')
+        if not isinstance(target, str) or not _is_safe_path_segment(target):
+            raise ProtocolError(f'Invalid target: {smart_repr(target)}')
+        await serve_client(conf, reader, writer, dst_path.parent, target, prefix_length)
 
     except ConnectionClosed:
         logger.info('Client closed connection')
@@ -173,56 +166,11 @@ async def handle_client(conf, reader, writer):
         writer.close()
 
 
-async def serve_legacy(conf, reader, writer, dst_path, prefix_length, prefix_sha1):
+async def serve_client(conf, reader, writer, dst_dir, target, prefix_length):
     '''
-    Pre-v2 protocol: the server picks the file from ``path`` alone and rotates it
-    aside (content-based) when the agent's prefix does not match. Retained only
-    for backward compatibility with agents that do not send an explicit target.
-    '''
-    f = None
-    try:
-        try:
-            f = dst_path.open('rb+')
-        except FileNotFoundError:
-            f = None
-            logger.debug('File does not exist yet: %s', dst_path)
-        else:
-            assert f.tell() == 0
-            f_prefix = f.read(prefix_length)
-            if f_prefix and sha1_b64(f_prefix) == prefix_sha1:
-                # it's the correct file :)
-                logger.info('File has the correct prefix: %s', dst_path)
-            else:
-                # need to create new file
-                logger.info('File has different prefix, rotating: %s', dst_path)
-                f.close()
-                f = None
-                iso_dt = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-                dst_path.rename(dst_path.with_name(dst_path.name + f".rotated-{iso_dt}"))
-
-        if not f:
-            logger.info('Creating new file: %s', dst_path)
-            f = dst_path.open('wb+')
-
-        f.seek(0, SEEK_END)
-        await send_reply(writer, 'ok', {'length': f.tell()})
-
-        while True:
-            command, metadata, data = await recv_command(reader)
-            if command != 'data':
-                raise ProtocolError(f"Expected 'data' command, received {smart_repr(command)}")
-            await apply_data(f, dst_path, metadata, data)
-            await send_reply(writer, 'ok', None)
-    finally:
-        if f:
-            f.close()
-
-
-async def serve_v2(conf, reader, writer, dst_dir, target, prefix_length):
-    '''
-    v2 protocol: the agent is the sole authority on file identity and rotation.
-    The server only appends to the agent-named ``target`` and renames it when
-    told to; it never decides identity from content.
+    The agent is the sole authority on file identity and rotation. The server
+    only appends to the agent-named ``target`` and renames it when told to; it
+    never decides identity from content.
     '''
     dst_path = dst_dir / target
     f = None
@@ -251,11 +199,15 @@ async def serve_v2(conf, reader, writer, dst_dir, target, prefix_length):
             if command == 'data':
                 if f is None:
                     # Lazily create the target on the first append. A new target
-                    # has length 0, so the first write must be at offset 0.
-                    if metadata.get('offset') != 0:
+                    # has length 0, so the first write must be at integer offset
+                    # 0. Validate before creating so a malformed first frame
+                    # never leaves a stray empty file behind.
+                    if not isinstance(metadata, dict):
+                        raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
+                    offset = metadata.get('offset')
+                    if not isinstance(offset, int) or isinstance(offset, bool) or offset != 0:
                         raise ProtocolError(
-                            'First append to a new target {} must be at offset 0, got {!r}'.format(
-                                dst_path, metadata.get('offset')))
+                            'First append to a new target {} must be at offset 0, got {!r}'.format(dst_path, offset))
                     logger.info('Creating new target: %s', dst_path)
                     f = dst_path.open('wb+')
                 await apply_data(f, dst_path, metadata, data)

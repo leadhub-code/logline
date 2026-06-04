@@ -1,5 +1,5 @@
 '''
-Per-tailed-path coordinator with agent-driven rotation (PLAN_v2).
+Per-tailed-path coordinator with agent-driven rotation.
 
 The agent is the sole authority on file identity and rotation. For each tailed
 path it owns one or more *segment* connections, each bound to an explicit

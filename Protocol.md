@@ -30,11 +30,7 @@ opens the target if it exists and **reports** its current `length` and the SHA-1
 (base64) of its first `prefix.length` bytes as `prefix_sha1` (`null` if the target
 does not exist). The server never rotates. The agent compares `prefix_sha1` with
 the inode it intends to stream and decides what to do (resume, or seal a stale
-target aside first).
-
-A handshake without a `target` field selects the legacy (pre-v2) behaviour, where
-the server picks the file from `path` alone and rotates it aside on a prefix
-mismatch. This exists only for backward compatibility during rollout.
+target aside first). A handshake without a valid `target` is rejected.
 
 Data
 ----

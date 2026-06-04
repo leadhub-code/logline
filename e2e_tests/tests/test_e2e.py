@@ -206,7 +206,7 @@ def poll_until(condition, processes, timeout=15, what='condition'):
 
 def test_rotate_log_file(tmp_path):
     '''
-    Full agent-driven rotation against the v2 server, lh-logrotate style: the old
+    Full agent-driven rotation against the server, lh-logrotate style: the old
     inode is moved aside, the ``.lh-logrotate-waiting`` marker appears, and a new
     inode is created under the original name. The agent must seal the old segment
     under its dated name, stream the new inode into the live name, and finalize

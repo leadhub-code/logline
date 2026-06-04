@@ -23,6 +23,7 @@ def valid_header(**overrides):
     header = {
         'hostname': 'host.example.com',
         'path': '/var/log/app.log',
+        'target': 'app.log',
         'prefix': {'length': len(PREFIX_DATA), 'sha1': sha1_b64(PREFIX_DATA)},
         'auth': {'client_token': CLIENT_TOKEN},
     }
@@ -152,9 +153,10 @@ def test_non_dict_data_metadata_is_rejected(tmp_path):
         frame('logline-agent-v1', valid_header()),
         frame('data', ['not', 'a', 'dict'], b'log line\n'),
     )
-    # The header reply succeeds, but the malformed data must not be written.
+    # The header reply succeeds, but the malformed first frame is rejected
+    # before the target is lazily created, so no file appears.
     assert writer.buffer.count(b'ok') == 1
-    assert dst_file(tmp_path).read_bytes() == b''
+    assert not dst_file(tmp_path).exists()
 
 
 def test_non_int_offset_is_rejected(tmp_path):
@@ -164,8 +166,10 @@ def test_non_int_offset_is_rejected(tmp_path):
         frame('logline-agent-v1', valid_header()),
         frame('data', {'offset': 'zero', 'compression': None}, b'log line\n'),
     )
+    # A non-zero/invalid offset on the first frame is rejected before the
+    # target is lazily created, so no file appears.
     assert writer.buffer.count(b'ok') == 1
-    assert dst_file(tmp_path).read_bytes() == b''
+    assert not dst_file(tmp_path).exists()
 
 
 def test_boolean_offset_is_rejected(tmp_path):
@@ -176,5 +180,7 @@ def test_boolean_offset_is_rejected(tmp_path):
         frame('logline-agent-v1', valid_header()),
         frame('data', {'offset': False, 'compression': None}, b'log line\n'),
     )
+    # A boolean offset is rejected before the target is lazily created
+    # (bool is not accepted even though False == 0), so no file appears.
     assert writer.buffer.count(b'ok') == 1
-    assert dst_file(tmp_path).read_bytes() == b''
+    assert not dst_file(tmp_path).exists()

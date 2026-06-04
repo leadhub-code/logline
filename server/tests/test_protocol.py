@@ -1,5 +1,5 @@
 '''
-Protocol-level tests for the v2 server: explicit agent-named target, length +
+Protocol-level tests for the server: explicit agent-named target, length +
 prefix_sha1 reporting (never rotate), idempotent in-band rename (the open fd
 survives the rename), and the explicit offset check.
 
@@ -155,7 +155,7 @@ def test_never_rotates_on_prefix_mismatch(tmp_path):
     d = dst_dir(tmp_path)
     d.mkdir(parents=True)
     (d / 'app.log').write_bytes(b'OLD content')
-    # the agent's prefix does not match; v2 must just report, never rotate
+    # the agent's prefix does not match; the server must just report, never rotate
     writer = drive(make_conf(tmp_path), hello('app.log', b'NEWp'))
     assert replies(writer)[0][1]['prefix_sha1'] == sha1_b64(b'OLD ')
     assert (d / 'app.log').read_bytes() == b'OLD content'
