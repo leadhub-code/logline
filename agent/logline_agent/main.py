@@ -9,6 +9,7 @@ from pathlib import Path
 from .client import connect_to_server
 from .configuration import Configuration
 from .coordinator import PathCoordinator
+from .telemetry import init_metrics, set_files_watched_source, shutdown_metrics
 
 
 logger = getLogger(__name__)
@@ -78,18 +79,23 @@ async def async_main(conf):
     watched_paths = {}
     assert conf.server_host
     assert conf.server_port
+    metrics_provider = init_metrics(conf)
+    set_files_watched_source(lambda: len(watched_paths))
     client_factory = partial(connect_to_server, conf=conf)
-    while True:
-        for p in iter_files(conf):
-            p_task = watched_paths.get(str(p))
-            if p_task and p_task.done():
-                logger.warning('Task for path %s is not running; task.exception: %r', p, p_task.exception())
-                p_task = None
-            if p_task is None:
-                #logger.debug('Found out new path %s from glob %s', p, glob_str)
-                watched_paths[str(p)] = create_task(watch_path(conf, p, client_factory))
+    try:
+        while True:
+            for p in iter_files(conf):
+                p_task = watched_paths.get(str(p))
+                if p_task and p_task.done():
+                    logger.warning('Task for path %s is not running; task.exception: %r', p, p_task.exception())
+                    p_task = None
+                if p_task is None:
+                    #logger.debug('Found out new path %s from glob %s', p, glob_str)
+                    watched_paths[str(p)] = create_task(watch_path(conf, p, client_factory))
 
-        await sleep(conf.scan_new_files_interval_seconds)
+            await sleep(conf.scan_new_files_interval_seconds)
+    finally:
+        shutdown_metrics(metrics_provider)
 
 
 def iter_files(conf):

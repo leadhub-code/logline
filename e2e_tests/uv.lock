@@ -60,7 +60,12 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyyaml" }]
+requires-dist = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'otel'" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'" },
+    { name = "pyyaml" },
+]
+provides-extras = ["otel"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]
@@ -98,7 +103,12 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pyyaml" }]
+requires-dist = [
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "extra == 'otel'" },
+    { name = "opentelemetry-sdk", marker = "extra == 'otel'" },
+    { name = "pyyaml" },
+]
+provides-extras = ["otel"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]

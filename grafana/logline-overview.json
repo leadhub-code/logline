@@ -1,0 +1,278 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Operational metrics for the logline agents and servers, exported over OTLP. Agents are distinguished by host_name; every process (agent or server) carries a unique service_instance_id, so many agents or several server instances on one host stay distinct. Metric names assume the OpenTelemetry collector's Prometheus naming (unit and _total suffixes) and delta->cumulative conversion.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "liveNow": false,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["logline", "otel"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "eerjmty8wjhmof" },
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "refresh": 1,
+        "regex": ""
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(logline_agent_files_watched, host_name)",
+        "query": { "qryType": 1, "query": "label_values(logline_agent_files_watched, host_name)", "refId": "host" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      },
+      {
+        "name": "instance",
+        "label": "Server instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "definition": "label_values(logline_server_active_connections, service_instance_id)",
+        "query": { "qryType": 1, "query": "label_values(logline_server_active_connections, service_instance_id)", "refId": "instance" },
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": "All", "value": "$__all" },
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Logline — agents & servers (OTel)",
+  "uid": "logline-otel-overview",
+  "version": 1,
+  "panels": [
+    {
+      "type": "row",
+      "id": 1,
+      "title": "Agents — fleet",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Files watched",
+      "description": "Live count of tailed files, summed across the selected hosts.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "auto" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(logline_agent_files_watched{host_name=~\"$host\"})", "legendFormat": "files" }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Shipping lag (max)",
+      "description": "Worst-case bytes still pending shipment across all tailed files. The single most valuable health signal: how far behind real-time the agents are.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1048576 }, { "color": "red", "value": 67108864 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "auto" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "max(logline_agent_shipping_lag_bytes{host_name=~\"$host\"})", "legendFormat": "max lag" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 4,
+      "title": "Throughput — read vs wire",
+      "description": "Uncompressed bytes read from tailed files vs compressed bytes put on the wire. The gap is compression effectiveness.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_read_bytes_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "read (uncompressed)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_sent_wire_bytes_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "wire (compressed)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 5,
+      "title": "Send round-trip latency",
+      "description": "Per-frame round-trip time agent -> server -> ack. The server-responsiveness SLI.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_agent_send_duration_seconds_bucket{host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_agent_send_duration_seconds_bucket{host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_agent_send_duration_seconds_bucket{host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 6,
+      "title": "Frame error ratio",
+      "description": "Fraction of frames the server rejected. A non-zero floor is the leading reliability alarm.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_frames_total{result=\"error\",host_name=~\"$host\"}[$__rate_interval])) / clamp_min(sum(rate(logline_agent_frames_total{host_name=~\"$host\"}[$__rate_interval])), 1)", "legendFormat": "error ratio" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 7,
+      "title": "Connection attempts & rotations",
+      "description": "Server connection attempts by outcome (reconnect storms = top health signal) and detected log rotations.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(logline_agent_connects_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "connect {{result}}" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_rotations_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "rotations" }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 8,
+      "title": "Servers",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 }
+    },
+    {
+      "type": "timeseries",
+      "id": 9,
+      "title": "Active connections by instance",
+      "description": "Concurrent open client connections per server instance. Uneven series across instances sharing a port means skewed kernel load-balancing.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "stacking": { "mode": "none" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_instance_id) (logline_server_active_connections{service_instance_id=~\"$instance\",host_name=~\"$host\"})", "legendFormat": "{{service_instance_id}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 10,
+      "title": "Connection accept rate",
+      "description": "Accepted client connections by outcome.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [ { "matcher": { "id": "byFrameRefID", "options": "B" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(logline_server_connections_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 11,
+      "title": "Server throughput",
+      "description": "Bytes received on the wire vs decompressed bytes written to disk.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 15 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_server_bytes_received_wire_bytes_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "received (wire)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_server_bytes_written_bytes_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "written (disk)" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 12,
+      "title": "Write flush latency",
+      "description": "Time to write and flush one data frame. Flush-per-frame is the likely server bottleneck.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 13,
+      "title": "Decompress latency (p95) by codec",
+      "description": "Thread-pool offload cost to decompress one frame, split by compression codec.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le, compression) (rate(logline_server_decompress_duration_seconds_bucket{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "{{compression}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 14,
+      "title": "Protocol errors by type",
+      "description": "Protocol violations. offset_mismatch is an integrity alarm; bad_compression and http_request point at misconfigured or misbehaving clients.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (error_type) (rate(logline_server_protocol_errors_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{error_type}}" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 15,
+      "title": "Auth failures",
+      "description": "Rejected client authentications — a security signal.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 29 },
+      "fieldConfig": { "defaults": { "unit": "cps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1 }, "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_server_auth_failures_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "auth failures" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 16,
+      "title": "Rename frames by outcome",
+      "description": "Agent-driven rotation rename frames applied on the server (ok / noop / error).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 29 },
+      "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(logline_server_renames_total{service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{result}}" }
+      ]
+    }
+  ]
+}

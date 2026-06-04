@@ -12,8 +12,23 @@ import lzma
 import os
 from reprlib import repr as smart_repr
 from ssl import Purpose, create_default_context
+from time import monotonic as monotime
 
 from .configuration import Configuration, ConfigurationError
+from .telemetry import (
+    active_connection_dec,
+    active_connection_inc,
+    init_metrics,
+    record_auth_failure,
+    record_bytes_received,
+    record_bytes_written,
+    record_connection,
+    record_decompress_duration,
+    record_protocol_error,
+    record_rename,
+    record_write_duration,
+    shutdown_metrics,
+)
 from .util import decompress_zst
 
 
@@ -77,10 +92,14 @@ def setup_log_file(log_file_path):
 
 
 async def async_main(conf):
-    server = await create_server(conf)
-    logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
-    async with server:
-        await server.serve_forever()
+    metrics_provider = init_metrics(conf)
+    try:
+        server = await create_server(conf)
+        logger.info('Listening on %s', ' '.join(str(s.getsockname()) for s in server.sockets))
+        async with server:
+            await server.serve_forever()
+    finally:
+        shutdown_metrics(metrics_provider)
 
 
 async def create_server(conf):
@@ -106,6 +125,8 @@ async def create_server(conf):
 
 
 async def handle_client(conf, reader, writer):
+    result = 'ok'
+    active_connection_inc()
     try:
         addr = writer.get_extra_info('peername')
         logger.info('New client has connected: %s', addr)
@@ -113,10 +134,12 @@ async def handle_client(conf, reader, writer):
             command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
         except ReceivedHTTPRequestError:
             logger.info('Received like HTTP request')
+            record_protocol_error('http_request')
             await send_http_response(writer)
             return
         except TimeoutError:
             logger.info('Client did not send the initial command within %s s, closing connection', handshake_timeout)
+            result = 'error'
             return
         if command != 'logline-agent-v1' or data:
             raise Exception(f"Protocol error - received {smart_repr(command)} as first command")
@@ -140,7 +163,11 @@ async def handle_client(conf, reader, writer):
         auth = header['auth']
         if not isinstance(auth, dict):
             raise ProtocolError(f'Expected a JSON object as auth, received {smart_repr(auth)}')
-        check_client_auth(conf, auth)
+        try:
+            check_client_auth(conf, auth)
+        except Exception:
+            record_auth_failure()
+            raise
 
         # The agent sends the source `directory` and the destination leaf name
         # `target` separately: the directory maps to <dest>/<hostname>/<mangled>
@@ -165,10 +192,16 @@ async def handle_client(conf, reader, writer):
         await serve_client(conf, reader, writer, dst_dir, target, prefix_length)
 
     except ConnectionClosed:
+        # A clean socket close is the normal end of a connection: agents close and
+        # reconnect routinely (on every send retry and every rename), so this is
+        # not an error and must not inflate the connection / protocol-error counters.
         logger.info('Client closed connection')
     except Exception as e:
         logger.exception('Failed to handle client: %r', e)
+        result = 'error'
     finally:
+        record_connection(result)
+        active_connection_dec()
         logger.info('Closing connection')
         writer.close()
 
@@ -236,22 +269,30 @@ async def apply_data(f, dst_path, metadata, data):
     if not isinstance(metadata, dict):
         raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
     compression = metadata.get('compression')
-    if compression == 'gzip':
-        data = await to_thread(gzip.decompress, data)
-    elif compression == 'lzma':
-        data = await to_thread(lzma.decompress, data)
-    elif compression == 'zst':
-        data = await decompress_zst(data)
-    elif compression is not None:
-        raise Exception(f"Unsupported compression method: {compression}")
+    if compression is not None:
+        t0 = monotime()
+        if compression == 'gzip':
+            data = await to_thread(gzip.decompress, data)
+        elif compression == 'lzma':
+            data = await to_thread(lzma.decompress, data)
+        elif compression == 'zst':
+            data = await decompress_zst(data)
+        else:
+            record_protocol_error('bad_compression')
+            raise Exception(f"Unsupported compression method: {compression}")
+        record_decompress_duration(compression, monotime() - t0)
     offset = metadata.get('offset')
     if not isinstance(offset, int) or isinstance(offset, bool):
         raise ProtocolError(f'Invalid data offset: {smart_repr(offset)}')
     if offset != f.tell():
+        record_protocol_error('offset_mismatch')
         raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
     logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
+    t0 = monotime()
     f.write(data)
     f.flush()
+    record_write_duration(monotime() - t0)
+    record_bytes_written(len(data))
 
 
 def handle_rename(dst_dir, current_path, f, metadata):
@@ -271,8 +312,10 @@ def handle_rename(dst_dir, current_path, f, metadata):
     src = metadata.get('from')
     dst = metadata.get('to')
     if not isinstance(src, str) or not _is_safe_path_segment(src):
+        record_rename('error')
         raise ProtocolError(f'Invalid rename "from": {smart_repr(src)}')
     if not isinstance(dst, str) or not _is_safe_path_segment(dst):
+        record_rename('error')
         raise ProtocolError(f'Invalid rename "to": {smart_repr(dst)}')
     src_path = dst_dir / src
     new_path = dst_dir / dst
@@ -281,6 +324,7 @@ def handle_rename(dst_dir, current_path, f, metadata):
     if src_path.exists():
         src_path.rename(new_path)
         logger.info('Renamed %s -> %s', src_path, new_path)
+        record_rename('ok')
         if fd_follows:
             try:
                 f.flush()
@@ -289,7 +333,9 @@ def handle_rename(dst_dir, current_path, f, metadata):
                 logger.warning('fsync of %s failed: %r', new_path, e)
     elif new_path.exists():
         logger.info('Rename %s -> %s is a no-op (%s already exists)', src_path, new_path, new_path)
+        record_rename('noop')
     else:
+        record_rename('error')
         raise ProtocolError(
             f'Cannot rename: neither {smart_repr(src)} nor {smart_repr(dst)} exists in {dst_dir}')
 
@@ -426,6 +472,7 @@ async def recv_command(reader, first=False):
         data = b''
     else:
         data = await reader.readexactly(data_size)
+    record_bytes_received(metadata_size + (data_size or 0))
     if data is None:
         logger.debug('Received %s %r', command, metadata)
     else:

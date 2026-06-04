@@ -14,6 +14,12 @@ dependencies = [
     "pyyaml",
 ]
 
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-grpc",
+]
+
 [project.urls]
 Homepage = "https://github.com/leadhub-code/logline"
 
