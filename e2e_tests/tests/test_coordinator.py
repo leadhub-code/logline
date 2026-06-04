@@ -34,10 +34,10 @@ def make_agent_conf(port):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
-        prefix_length=50, min_prefix_length=20,
-        tail_read_interval=0.02, scan_new_files_interval=0.02,
-        rotated_files_inactivity_threshold=0.2,
-        seal_marker_grace=0.15, seal_idle=0.2)
+        prefix_length_bytes=50, min_prefix_length_bytes=20,
+        tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
+        rotated_files_inactivity_threshold_seconds=0.2,
+        seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2)
 
 
 def dst_dir_for(dst, src):

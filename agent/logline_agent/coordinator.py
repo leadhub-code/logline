@@ -79,7 +79,7 @@ class Segment:
         while not self._sealed.is_set():
             if self.task is not None and self.task.done():
                 return
-            await asyncio.sleep(self.conf.tail_read_interval)
+            await asyncio.sleep(self.conf.tail_read_interval_seconds)
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -105,7 +105,7 @@ class Segment:
                 # do not process our own logfile too often to avoid feedback noise
                 await asyncio.sleep(60)
             elif not sent:
-                await asyncio.sleep(self.conf.tail_read_interval)
+                await asyncio.sleep(self.conf.tail_read_interval_seconds)
 
     async def _do_seal(self):
         seal_name, is_orphan, iso_dt = self._pending_seal
@@ -131,15 +131,15 @@ class Segment:
             logger.info('Finalized %s as %s', self.file_path, final)
 
     async def _drain_until_idle(self):
-        '''Orphan completion: drain until no growth for ``seal_idle`` seconds.'''
+        '''Orphan completion: drain until no growth for ``seal_idle_seconds``.'''
         from time import monotonic as monotime
         last_active = monotime()
         while True:
             if await self._drain_available():
                 last_active = monotime()
-            elif monotime() - last_active > self.conf.seal_idle:
+            elif monotime() - last_active > self.conf.seal_idle_seconds:
                 return
-            await asyncio.sleep(self.conf.tail_read_interval)
+            await asyncio.sleep(self.conf.tail_read_interval_seconds)
 
     async def _drain_until_sha13(self, iso_dt):
         '''
@@ -151,7 +151,7 @@ class Segment:
             sha13 = self.markers.sha13_for(iso_dt)
             if sha13 is not None:
                 return sha13
-            await asyncio.sleep(self.conf.tail_read_interval)
+            await asyncio.sleep(self.conf.tail_read_interval_seconds)
 
     # -- connection / IO ---------------------------------------------------
 
@@ -229,7 +229,7 @@ class Segment:
 
     def _read_prefix(self):
         self.file_stream.seek(0)
-        return self.file_stream.read(self.conf.prefix_length)
+        return self.file_stream.read(self.conf.prefix_length_bytes)
 
     def _close(self):
         try:
@@ -267,7 +267,7 @@ class PathCoordinator:
                 if inode is not None and inode != self.last_inode:
                     await self._on_new_inode(inode)
                     self.last_inode = inode
-                await asyncio.sleep(self.conf.tail_read_interval)
+                await asyncio.sleep(self.conf.tail_read_interval_seconds)
         finally:
             marker_task.cancel()
             await _cancel(marker_task)
@@ -304,16 +304,16 @@ class PathCoordinator:
 
     async def _learn_iso_dt(self):
         '''
-        Wait up to ``seal_marker_grace`` for lh-logrotate's ``.waiting`` marker
+        Wait up to ``seal_marker_grace_seconds`` for lh-logrotate's ``.waiting`` marker
         to learn ``<iso_dt>``. If it never appears, fall back to an orphan seal
         with a self-generated timestamp.
         '''
-        deadline_steps = max(1, int(self.conf.seal_marker_grace / self.conf.tail_read_interval))
+        deadline_steps = max(1, int(self.conf.seal_marker_grace_seconds / self.conf.tail_read_interval_seconds))
         for _ in range(deadline_steps + 1):
             iso_dt = self.markers.newest_unconsumed_waiting(self.consumed_isos)
             if iso_dt is not None:
                 return iso_dt, False
-            await asyncio.sleep(self.conf.tail_read_interval)
+            await asyncio.sleep(self.conf.tail_read_interval_seconds)
         return utc_iso_dt(), True
 
     def _make_segment(self, f, inode, target, role_live):

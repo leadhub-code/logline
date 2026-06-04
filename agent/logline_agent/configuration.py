@@ -90,26 +90,25 @@ class Configuration:
         else:
             raise ConfigurationError('Client token is not configured')
 
-        self.prefix_length = 50 # in bytes
-        self.min_prefix_length = 20 # in bytes
+        self.prefix_length_bytes = 50
+        self.min_prefix_length_bytes = 20
 
-        # All these intervals are in seconds (int or float)
-        self.tail_read_interval = 1
-        self.scan_new_files_interval = 1
-        self.rotated_files_inactivity_threshold = 600
+        self.tail_read_interval_seconds = 1
+        self.scan_new_files_interval_seconds = 1
+        self.rotated_files_inactivity_threshold_seconds = 600
 
         # After a new inode is detected, how long to wait for lh-logrotate's
         # `.lh-logrotate-waiting` marker before treating the rotation as an
         # orphan (markerless). lh-logrotate writes the marker as it rotates, so
         # the real wait is usually ~0; this is headroom for scan jitter. It also
         # bounds how long the new live segment is delayed, so keep it small.
-        self.seal_marker_grace = 10
+        self.seal_marker_grace_seconds = 10
 
         # Orphan only: how long the closing connection keeps draining with no
         # growth before it gives up and closes. Reuses the rotated-file
         # inactivity knob (a longer value is strictly safer - it only costs a
         # lingering fd, never data).
-        self.seal_idle = self.rotated_files_inactivity_threshold
+        self.seal_idle_seconds = self.rotated_files_inactivity_threshold_seconds
 
 
 def parse_address(s):

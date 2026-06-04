@@ -89,7 +89,7 @@ async def async_main(conf):
                 #logger.debug('Found out new path %s from glob %s', p, glob_str)
                 watched_paths[str(p)] = create_task(watch_path(conf, p, client_factory))
 
-        await sleep(conf.scan_new_files_interval)
+        await sleep(conf.scan_new_files_interval_seconds)
 
 
 def iter_files(conf):

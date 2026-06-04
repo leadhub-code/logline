@@ -43,7 +43,7 @@ class MarkerWatcher:
     async def run(self):
         while True:
             self.scan()
-            await asyncio.sleep(self.conf.tail_read_interval)
+            await asyncio.sleep(self.conf.tail_read_interval_seconds)
 
     def scan(self):
         try:
