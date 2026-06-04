@@ -8,6 +8,7 @@ import gzip
 from hashlib import sha1
 import json
 from logging import getLogger
+from pathlib import Path
 import re
 from socket import getfqdn
 from ssl import Purpose, create_default_context
@@ -31,7 +32,8 @@ async def connect_to_server(conf, log_path, target, log_prefix):
     '''
     Connect to the server specified in the configuration.
 
-    Initial header is sent to the server, containing some metadata, the explicit
+    Initial header is sent to the server, containing some metadata, the source
+    ``directory`` (which the server maps to a destination directory), the explicit
     agent-chosen ``target`` filename to write into, and the log file prefix.
     '''
     assert isinstance(log_prefix, bytes)
@@ -51,7 +53,7 @@ async def connect_to_server(conf, log_path, target, log_prefix):
     cc = ClientConnection(reader, writer)
     await cc.send_header({
         'hostname': getfqdn(),
-        'path': str(log_path),
+        'directory': str(Path(log_path).parent),
         'target': target,
         'prefix': {
             'length': len(log_prefix),

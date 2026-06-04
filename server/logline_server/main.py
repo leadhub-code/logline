@@ -123,7 +123,7 @@ async def handle_client(conf, reader, writer):
         header = metadata
         if not isinstance(header, dict):
             raise ProtocolError(f'Expected a JSON object as header, received {smart_repr(header)}')
-        for field in ('hostname', 'path', 'prefix', 'auth'):
+        for field in ('hostname', 'prefix', 'auth'):
             if not header.get(field):
                 raise ProtocolError(f'Missing required header field: {field}')
 
@@ -142,20 +142,27 @@ async def handle_client(conf, reader, writer):
             raise ProtocolError(f'Expected a JSON object as auth, received {smart_repr(auth)}')
         check_client_auth(conf, auth)
 
-        dst_path = build_destination_path(
-            conf.destination_directory, header['hostname'], header['path'])
+        # The agent sends the source `directory` and the destination leaf name
+        # `target` separately: the directory maps to <dest>/<hostname>/<mangled>
+        # and groups all of a source directory's files, while `target` is the
+        # agent-chosen leaf (which differs from the source basename for
+        # sealed/finalized segments). The server never derives a filename itself.
+        directory = header.get('directory')
+        if not isinstance(directory, str):
+            raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
+        dst_dir = build_destination_dir(conf.destination_directory, header['hostname'], directory)
 
-        if not dst_path.parent.is_dir():
-            if not dst_path.parent.parent.is_dir():
-                logger.debug('Creating directory: %s', dst_path.parent.parent)
-                dst_path.parent.parent.mkdir()
-            logger.debug('Creating directory: %s', dst_path.parent)
-            dst_path.parent.mkdir()
+        if not dst_dir.is_dir():
+            if not dst_dir.parent.is_dir():
+                logger.debug('Creating directory: %s', dst_dir.parent)
+                dst_dir.parent.mkdir()
+            logger.debug('Creating directory: %s', dst_dir)
+            dst_dir.mkdir()
 
         target = header.get('target')
         if not isinstance(target, str) or not _is_safe_path_segment(target):
             raise ProtocolError(f'Invalid target: {smart_repr(target)}')
-        await serve_client(conf, reader, writer, dst_path.parent, target, prefix_length)
+        await serve_client(conf, reader, writer, dst_dir, target, prefix_length)
 
     except ConnectionClosed:
         logger.info('Client closed connection')
@@ -321,43 +328,40 @@ def _is_safe_path_segment(segment):
     return True
 
 
-def build_destination_path(destination_directory, hostname, path):
+def build_destination_dir(destination_directory, hostname, directory):
     '''
-    Build the destination file path for the received log file.
+    Build the destination directory for received log files: the mangled source
+    ``directory`` placed under ``<dest>/<hostname>/``. The file's leaf name is the
+    agent-chosen ``target``, which the caller joins on separately.
 
-    The hostname and path values come from the (authenticated but otherwise
+    The hostname and directory values come from the (authenticated but otherwise
     untrusted) client, so they must never be allowed to escape the configured
     destination directory via path traversal.
     '''
     if not isinstance(hostname, str):
         raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
-    if not isinstance(path, str):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
+    if not isinstance(directory, str):
+        raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
     if not _is_safe_path_segment(hostname):
         raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
 
-    *dir_parts, filename = path.strip('/').split('/')
-    if not _is_safe_path_segment(filename):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
-
-    # dir_parts are joined with '~' into a single path segment, so any '/' they
-    # might contain has already been removed by split('/'); still reject any
-    # remaining traversal or null-byte characters defensively.
-    mangled_dir = '~'.join(dir_parts)
+    # The source directory's components are joined with '~' into a single path
+    # segment, so any '/' is removed by split('/'); still reject any remaining
+    # traversal or null-byte characters defensively.
+    mangled_dir = '~'.join(directory.strip('/').split('/'))
     if '\x00' in mangled_dir or mangled_dir in ('.', '..'):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
+        raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
 
     base = destination_directory.resolve()
-    dst_path = (base / hostname / mangled_dir / filename) if mangled_dir \
-        else (base / hostname / filename)
+    dst_dir = (base / hostname / mangled_dir) if mangled_dir else (base / hostname)
 
     # Final defense in depth: make sure the resolved destination really stays
     # inside the configured destination directory.
-    resolved_parent = dst_path.parent.resolve()
-    if resolved_parent != base and base not in resolved_parent.parents:
-        raise ProtocolError(f'Refusing to write outside destination directory: {smart_repr(str(dst_path))}')
+    resolved = dst_dir.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ProtocolError(f'Refusing to write outside destination directory: {smart_repr(str(dst_dir))}')
 
-    return dst_path
+    return dst_dir
 
 
 def check_client_auth(conf, header_auth):

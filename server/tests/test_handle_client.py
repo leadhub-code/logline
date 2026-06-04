@@ -22,7 +22,7 @@ def frame(command, metadata, data=None):
 def valid_header(**overrides):
     header = {
         'hostname': 'host.example.com',
-        'path': '/var/log/app.log',
+        'directory': '/var/log',
         'target': 'app.log',
         'prefix': {'length': len(PREFIX_DATA), 'sha1': sha1_b64(PREFIX_DATA)},
         'auth': {'client_token': CLIENT_TOKEN},
@@ -118,9 +118,9 @@ def test_non_string_hostname_is_rejected(tmp_path):
     assert not dst_file(tmp_path).exists()
 
 
-def test_non_string_path_is_rejected(tmp_path):
+def test_non_string_directory_is_rejected(tmp_path):
     conf = make_conf(tmp_path)
-    writer = drive(conf, frame('logline-agent-v1', valid_header(path=['/var/log/app.log'])))
+    writer = drive(conf, frame('logline-agent-v1', valid_header(directory=['/var/log'])))
     assert b'ok' not in writer.buffer
     assert not dst_file(tmp_path).exists()
 

@@ -20,17 +20,20 @@ Handshake
 ```
 Agent (A) connects to Server (S)
 A: logline-agent-v1 153\n
-A: {"hostname": "server.example.com", "path": "/var/log/something.log", "target": "something.log", "prefix": {"length": 42, "sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}, "auth": {"client_token": "..."}}\n
+A: {"hostname": "server.example.com", "directory": "/var/log", "target": "something.log", "prefix": {"length": 42, "sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}, "auth": {"client_token": "..."}}\n
 S: ok 44\n
 S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}\n
 ```
 
-The server resolves the directory from `path` and writes to `<dir>/<target>`. It
-opens the target if it exists and **reports** its current `length` and the SHA-1
-(base64) of its first `prefix.length` bytes as `prefix_sha1` (`null` if the target
-does not exist). The server never rotates. The agent compares `prefix_sha1` with
-the inode it intends to stream and decides what to do (resume, or seal a stale
-target aside first). A handshake without a valid `target` is rejected.
+The agent sends the source `directory` and the destination leaf `target`
+separately. The server maps `directory` to `<dest>/<hostname>/<mangled-directory>`
+(each `/` becomes `~`) and writes to `<that directory>/<target>`; it never derives
+a filename from content. It opens the target if it exists and **reports** its
+current `length` and the SHA-1 (base64) of its first `prefix.length` bytes as
+`prefix_sha1` (`null` if the target does not exist). The server never rotates. The
+agent compares `prefix_sha1` with the inode it intends to stream and decides what
+to do (resume, or seal a stale target aside first). A handshake without a valid
+`target` is rejected.
 
 Data
 ----

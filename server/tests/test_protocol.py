@@ -26,10 +26,10 @@ def frame(command, metadata, data=None):
     return f'{command} {len(metadata_bytes)} {len(data)}\n'.encode('ascii') + metadata_bytes + data
 
 
-def hello(target, prefix, path='/var/log/app.log', **overrides):
+def hello(target, prefix, directory='/var/log', **overrides):
     header = {
         'hostname': 'host.example.com',
-        'path': path,
+        'directory': directory,
         'target': target,
         'prefix': {'length': len(prefix), 'sha1': sha1_b64(prefix)},
         'auth': {'client_token': CLIENT_TOKEN},
