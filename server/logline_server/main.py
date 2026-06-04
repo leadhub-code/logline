@@ -1,7 +1,6 @@
 from argparse import ArgumentParser
 from asyncio import TimeoutError, run, start_server, to_thread, wait_for
 from base64 import b64encode
-from datetime import datetime, timezone
 from functools import partial
 import gzip
 from hashlib import sha1
@@ -10,6 +9,7 @@ import json
 from logging import DEBUG, ERROR, INFO, Formatter, StreamHandler, getLogger
 from logging.handlers import WatchedFileHandler
 import lzma
+import os
 from reprlib import repr as smart_repr
 from ssl import Purpose, create_default_context
 
@@ -106,7 +106,6 @@ async def create_server(conf):
 
 
 async def handle_client(conf, reader, writer):
-    f = None
     try:
         addr = writer.get_extra_info('peername')
         logger.info('New client has connected: %s', addr)
@@ -124,7 +123,7 @@ async def handle_client(conf, reader, writer):
         header = metadata
         if not isinstance(header, dict):
             raise ProtocolError(f'Expected a JSON object as header, received {smart_repr(header)}')
-        for field in ('hostname', 'path', 'prefix', 'auth'):
+        for field in ('hostname', 'prefix', 'auth'):
             if not header.get(field):
                 raise ProtocolError(f'Missing required header field: {field}')
 
@@ -143,69 +142,27 @@ async def handle_client(conf, reader, writer):
             raise ProtocolError(f'Expected a JSON object as auth, received {smart_repr(auth)}')
         check_client_auth(conf, auth)
 
-        dst_path = build_destination_path(
-            conf.destination_directory, header['hostname'], header['path'])
+        # The agent sends the source `directory` and the destination leaf name
+        # `target` separately: the directory maps to <dest>/<hostname>/<mangled>
+        # and groups all of a source directory's files, while `target` is the
+        # agent-chosen leaf (which differs from the source basename for
+        # sealed/finalized segments). The server never derives a filename itself.
+        directory = header.get('directory')
+        if not isinstance(directory, str):
+            raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
+        dst_dir = build_destination_dir(conf.destination_directory, header['hostname'], directory)
 
-        if not dst_path.parent.is_dir():
-            if not dst_path.parent.parent.is_dir():
-                logger.debug('Creating directory: %s', dst_path.parent.parent)
-                dst_path.parent.parent.mkdir()
-            logger.debug('Creating directory: %s', dst_path.parent)
-            dst_path.parent.mkdir()
+        if not dst_dir.is_dir():
+            if not dst_dir.parent.is_dir():
+                logger.debug('Creating directory: %s', dst_dir.parent)
+                dst_dir.parent.mkdir()
+            logger.debug('Creating directory: %s', dst_dir)
+            dst_dir.mkdir()
 
-        try:
-            f = dst_path.open('rb+')
-        except FileNotFoundError:
-            f = None
-            logger.debug('File does not exist yet: %s', dst_path)
-        else:
-            assert f.tell() == 0
-            f_prefix = f.read(prefix_length)
-            if f_prefix and sha1_b64(f_prefix) == prefix_sha1:
-                # it's the correct file :)
-                logger.info('File has the correct prefix: %s', dst_path)
-            else:
-                # need to create new file
-                logger.info('File has different prefix, rotating: %s', dst_path)
-                f.close()
-                f = None
-                iso_dt = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-                dst_path.rename(dst_path.with_name(dst_path.name + f".rotated-{iso_dt}"))
-
-        if not f:
-            logger.info('Creating new file: %s', dst_path)
-            f = dst_path.open('wb+')
-
-        f.seek(0, SEEK_END)
-        f_length = f.tell()
-
-        await send_reply(writer, 'ok', {'length': f_length})
-
-        while True:
-            command, metadata, data = await recv_command(reader)
-            if command != 'data':
-                raise Exception(f"Protocol error - expected 'data', received {smart_repr(command)}")
-            if not isinstance(data, bytes):
-                raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
-            if not isinstance(metadata, dict):
-                raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
-            if metadata.get('compression') == 'gzip':
-                data = await to_thread(gzip.decompress, data)
-            elif metadata.get('compression') == 'lzma':
-                data = await to_thread(lzma.decompress, data)
-            elif metadata.get('compression') == 'zst':
-                data = await decompress_zst(data)
-            elif metadata.get('compression') is not None:
-                raise Exception(f"Unsupported compression method: {metadata['compression']}")
-            offset = metadata.get('offset')
-            if not isinstance(offset, int) or isinstance(offset, bool):
-                raise ProtocolError(f'Invalid data offset: {smart_repr(offset)}')
-            if offset != f.tell():
-                raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
-            logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
-            f.write(data)
-            f.flush()
-            await send_reply(writer, 'ok', None)
+        target = header.get('target')
+        if not isinstance(target, str) or not _is_safe_path_segment(target):
+            raise ProtocolError(f'Invalid target: {smart_repr(target)}')
+        await serve_client(conf, reader, writer, dst_dir, target, prefix_length)
 
     except ConnectionClosed:
         logger.info('Client closed connection')
@@ -214,8 +171,141 @@ async def handle_client(conf, reader, writer):
     finally:
         logger.info('Closing connection')
         writer.close()
+
+
+async def serve_client(conf, reader, writer, dst_dir, target, prefix_length):
+    '''
+    The agent is the sole authority on file identity and rotation. The server
+    only appends to the agent-named ``target`` and renames it when told to; it
+    never decides identity from content.
+    '''
+    dst_path = dst_dir / target
+    f = None
+    try:
+        try:
+            f = dst_path.open('rb+')
+        except FileNotFoundError:
+            f = None
+            logger.debug('Target does not exist yet: %s', dst_path)
+
+        # Report the current length and prefix hash; never rotate. The agent
+        # decides what to do from this (resume, or seal a stale file first).
+        if f is not None:
+            f.seek(0)
+            f_prefix = f.read(prefix_length)
+            prefix_sha1 = sha1_b64(f_prefix) if f_prefix else None
+            f.seek(0, SEEK_END)
+            length = f.tell()
+        else:
+            prefix_sha1 = None
+            length = 0
+        await send_reply(writer, 'ok', {'length': length, 'prefix_sha1': prefix_sha1})
+
+        while True:
+            command, metadata, data = await recv_command(reader)
+            if command == 'data':
+                if f is None:
+                    # Lazily create the target on the first append. A new target
+                    # has length 0, so the first write must be at integer offset
+                    # 0. Validate before creating so a malformed first frame
+                    # never leaves a stray empty file behind.
+                    if not isinstance(metadata, dict):
+                        raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
+                    offset = metadata.get('offset')
+                    if not isinstance(offset, int) or isinstance(offset, bool) or offset != 0:
+                        raise ProtocolError(
+                            'First append to a new target {} must be at offset 0, got {!r}'.format(dst_path, offset))
+                    logger.info('Creating new target: %s', dst_path)
+                    f = dst_path.open('wb+')
+                await apply_data(f, dst_path, metadata, data)
+                await send_reply(writer, 'ok', None)
+            elif command == 'rename':
+                dst_path = handle_rename(dst_dir, dst_path, f, metadata)
+                await send_reply(writer, 'ok', None)
+            else:
+                raise ProtocolError(f"Expected 'data' or 'rename' command, received {smart_repr(command)}")
+    finally:
         if f:
             f.close()
+
+
+async def apply_data(f, dst_path, metadata, data):
+    '''Decompress, verify the offset, append and flush a single ``data`` frame.'''
+    if not isinstance(data, bytes):
+        raise ProtocolError(f"Expected a payload with the 'data' command, received {smart_repr(data)}")
+    if not isinstance(metadata, dict):
+        raise ProtocolError(f"Expected a JSON object as 'data' metadata, received {smart_repr(metadata)}")
+    compression = metadata.get('compression')
+    if compression == 'gzip':
+        data = await to_thread(gzip.decompress, data)
+    elif compression == 'lzma':
+        data = await to_thread(lzma.decompress, data)
+    elif compression == 'zst':
+        data = await decompress_zst(data)
+    elif compression is not None:
+        raise Exception(f"Unsupported compression method: {compression}")
+    offset = metadata.get('offset')
+    if not isinstance(offset, int) or isinstance(offset, bool):
+        raise ProtocolError(f'Invalid data offset: {smart_repr(offset)}')
+    if offset != f.tell():
+        raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
+    logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
+    f.write(data)
+    f.flush()
+
+
+def handle_rename(dst_dir, current_path, f, metadata):
+    '''
+    Apply an in-band ``rename`` control frame within ``dst_dir``.
+
+    The frame is idempotent: if ``from`` is gone but ``to`` already exists the
+    rename is treated as already applied (safe for restart/replay). If the open
+    fd ``f`` holds the file being renamed it survives the rename (the same inode
+    is simply relabelled), so the connection keeps appending afterwards; we
+    return the file's new path so the caller's bookkeeping follows it.
+
+    Completed segments are made crash-durable here (and only here): fsync the
+    segment file and the parent directory so neither the final bytes nor the
+    rename can be lost on a server crash.
+    '''
+    src = metadata.get('from')
+    dst = metadata.get('to')
+    if not isinstance(src, str) or not _is_safe_path_segment(src):
+        raise ProtocolError(f'Invalid rename "from": {smart_repr(src)}')
+    if not isinstance(dst, str) or not _is_safe_path_segment(dst):
+        raise ProtocolError(f'Invalid rename "to": {smart_repr(dst)}')
+    src_path = dst_dir / src
+    new_path = dst_dir / dst
+    fd_follows = f is not None and src_path == current_path
+
+    if src_path.exists():
+        src_path.rename(new_path)
+        logger.info('Renamed %s -> %s', src_path, new_path)
+        if fd_follows:
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError as e:
+                logger.warning('fsync of %s failed: %r', new_path, e)
+    elif new_path.exists():
+        logger.info('Rename %s -> %s is a no-op (%s already exists)', src_path, new_path, new_path)
+    else:
+        raise ProtocolError(
+            f'Cannot rename: neither {smart_repr(src)} nor {smart_repr(dst)} exists in {dst_dir}')
+
+    fsync_dir(dst_dir)
+    return new_path if fd_follows else current_path
+
+
+def fsync_dir(path):
+    '''fsync a directory so a rename/create within it becomes durable.'''
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as e:
+        logger.warning('fsync of directory %s failed: %r', path, e)
+    finally:
+        os.close(fd)
 
 
 async def send_http_response(writer):
@@ -238,43 +328,40 @@ def _is_safe_path_segment(segment):
     return True
 
 
-def build_destination_path(destination_directory, hostname, path):
+def build_destination_dir(destination_directory, hostname, directory):
     '''
-    Build the destination file path for the received log file.
+    Build the destination directory for received log files: the mangled source
+    ``directory`` placed under ``<dest>/<hostname>/``. The file's leaf name is the
+    agent-chosen ``target``, which the caller joins on separately.
 
-    The hostname and path values come from the (authenticated but otherwise
+    The hostname and directory values come from the (authenticated but otherwise
     untrusted) client, so they must never be allowed to escape the configured
     destination directory via path traversal.
     '''
     if not isinstance(hostname, str):
         raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
-    if not isinstance(path, str):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
+    if not isinstance(directory, str):
+        raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
     if not _is_safe_path_segment(hostname):
         raise ProtocolError(f'Invalid hostname: {smart_repr(hostname)}')
 
-    *dir_parts, filename = path.strip('/').split('/')
-    if not _is_safe_path_segment(filename):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
-
-    # dir_parts are joined with '~' into a single path segment, so any '/' they
-    # might contain has already been removed by split('/'); still reject any
-    # remaining traversal or null-byte characters defensively.
-    mangled_dir = '~'.join(dir_parts)
+    # The source directory's components are joined with '~' into a single path
+    # segment, so any '/' is removed by split('/'); still reject any remaining
+    # traversal or null-byte characters defensively.
+    mangled_dir = '~'.join(directory.strip('/').split('/'))
     if '\x00' in mangled_dir or mangled_dir in ('.', '..'):
-        raise ProtocolError(f'Invalid path: {smart_repr(path)}')
+        raise ProtocolError(f'Invalid directory: {smart_repr(directory)}')
 
     base = destination_directory.resolve()
-    dst_path = (base / hostname / mangled_dir / filename) if mangled_dir \
-        else (base / hostname / filename)
+    dst_dir = (base / hostname / mangled_dir) if mangled_dir else (base / hostname)
 
     # Final defense in depth: make sure the resolved destination really stays
     # inside the configured destination directory.
-    resolved_parent = dst_path.parent.resolve()
-    if resolved_parent != base and base not in resolved_parent.parents:
-        raise ProtocolError(f'Refusing to write outside destination directory: {smart_repr(str(dst_path))}')
+    resolved = dst_dir.resolve()
+    if resolved != base and base not in resolved.parents:
+        raise ProtocolError(f'Refusing to write outside destination directory: {smart_repr(str(dst_dir))}')
 
-    return dst_path
+    return dst_dir
 
 
 def check_client_auth(conf, header_auth):
