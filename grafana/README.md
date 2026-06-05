@@ -29,8 +29,15 @@ Every process exports a unique `service_instance_id`; the collector adds
 `host_name`. Several agents on one host share a `host_name` but stay distinct by
 `service_instance_id`. Server deployments that share a host (each typically a
 group of `reuse_port` containers) are told apart by `service_namespace`, set per
-container group via `OTEL_RESOURCE_ATTRIBUTES=service.namespace=<name>`; the
-`reuse_port` containers within a group are then separated by `service_instance_id`.
+container group via `OTEL_RESOURCE_ATTRIBUTES`. The `reuse_port` containers
+within a group are given a stable ordinal `service.instance.index` (0, 1, …) so
+the dashboard can group by a readable, restart-stable label; the per-process
+uuid `service_instance_id` stays as the unique stream key for drilldown. Set
+both per container, e.g.:
 
-The dashboard has **Host**, **Server namespace**, and **Server instance**
-template variables built on those labels.
+```
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=server-a,service.instance.index=0
+```
+
+The dashboard has **Host**, **Server namespace**, and **Server instance
+(index)** template variables built on those labels.

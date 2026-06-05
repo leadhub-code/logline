@@ -4,7 +4,7 @@ Optional OpenTelemetry metrics for the agent.
 Metrics are off unless ``metrics.enabled`` is configured. While off this module
 is a complete no-op and the OpenTelemetry SDK is never imported, so the base
 install stays lean. When on, the SDK is imported lazily and the process exports
-delta-temporality metric streams over OTLP to a local collector.
+cumulative metric streams over OTLP to a local collector.
 
 ``host.name`` is left to the local collector by default (its resource detection
 adds the host's name), and is only attached here when explicitly configured.
@@ -54,8 +54,8 @@ def init_metrics(conf):
     import uuid
     try:
         from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-        from opentelemetry.sdk.metrics import Counter, Histogram, MeterProvider
-        from opentelemetry.sdk.metrics.export import AggregationTemporality, PeriodicExportingMetricReader
+        from opentelemetry.sdk.metrics import MeterProvider
+        from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
         from opentelemetry.sdk.resources import Resource
     except ImportError:
         logger.warning('Metrics are enabled but the OpenTelemetry SDK is not installed; '
@@ -66,12 +66,11 @@ def init_metrics(conf):
     if conf.metrics_host_name:
         attrs['host.name'] = conf.metrics_host_name
     resource = Resource.create(attrs)
-    exporter_kwargs = {
-        'preferred_temporality': {
-            Counter: AggregationTemporality.DELTA,
-            Histogram: AggregationTemporality.DELTA,
-        },
-    }
+    # Export cumulative temporality (the SDK default). The host collector's
+    # application metrics pipeline has no delta->cumulative step, so Prometheus
+    # only retains cumulative counters and histograms. A per-process
+    # service.instance.id makes each restart a fresh series, which rate() handles.
+    exporter_kwargs = {}
     if conf.metrics_endpoint:
         exporter_kwargs['endpoint'] = conf.metrics_endpoint
     reader = PeriodicExportingMetricReader(OTLPMetricExporter(**exporter_kwargs), export_interval_millis=10_000)

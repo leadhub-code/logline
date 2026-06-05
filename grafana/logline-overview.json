@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Operational metrics for the logline agents and servers, exported over OTLP. Agents are distinguished by host_name; every process (agent or server) carries a unique service_instance_id, and server deployments sharing a host are told apart by service_namespace (set via OTEL_RESOURCE_ATTRIBUTES per container group). Metric names assume the OpenTelemetry collector's Prometheus naming (unit and _total suffixes) and delta->cumulative conversion.",
+  "description": "Operational metrics for the logline agents and servers, exported over OTLP. Agents are distinguished by host_name; every process (agent or server) carries a unique service_instance_id. Server deployments sharing a host are told apart by service_namespace, and the reuse_port containers within a group by a stable service_instance_index (both set via OTEL_RESOURCE_ATTRIBUTES per container). Metric names assume the OpenTelemetry collector's Prometheus naming (unit and _total suffixes) and delta->cumulative conversion.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -39,8 +39,8 @@
         "label": "Host",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "definition": "label_values(logline_agent_files_watched, host_name)",
-        "query": { "qryType": 1, "query": "label_values(logline_agent_files_watched, host_name)", "refId": "host" },
+        "definition": "label_values(logline_agent_files_watched_ratio, host_name)",
+        "query": { "qryType": 1, "query": "label_values(logline_agent_files_watched_ratio, host_name)", "refId": "host" },
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -64,11 +64,11 @@
       },
       {
         "name": "instance",
-        "label": "Server instance",
+        "label": "Server instance (index)",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-        "definition": "label_values(logline_server_active_connections{service_namespace=~\"$namespace\"}, service_instance_id)",
-        "query": { "qryType": 1, "query": "label_values(logline_server_active_connections{service_namespace=~\"$namespace\"}, service_instance_id)", "refId": "instance" },
+        "definition": "label_values(logline_server_active_connections{service_namespace=~\"$namespace\"}, service_instance_index)",
+        "query": { "qryType": 1, "query": "label_values(logline_server_active_connections{service_namespace=~\"$namespace\"}, service_instance_index)", "refId": "instance" },
         "refresh": 2,
         "includeAll": true,
         "multi": true,
@@ -102,7 +102,7 @@
       "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null } ] } }, "overrides": [] },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "area", "textMode": "auto" },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(logline_agent_files_watched{host_name=~\"$host\"})", "legendFormat": "files" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(logline_agent_files_watched_ratio{host_name=~\"$host\"})", "legendFormat": "files" }
       ]
     },
     {
@@ -185,13 +185,13 @@
       "type": "timeseries",
       "id": 9,
       "title": "Active connections by instance",
-      "description": "Concurrent open client connections per server instance, labelled by namespace/instance. Several instances sharing a port should sit close together; one namespace far from the other points at skewed load.",
+      "description": "Concurrent open client connections per server instance, labelled by namespace/index (service.instance.index, stable across restarts). Several instances sharing a port should sit close together; one namespace far from the other points at skewed load.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 7, "w": 8, "x": 0, "y": 15 },
       "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "stacking": { "mode": "none" } } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace, service_instance_id) (logline_server_active_connections{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"})", "legendFormat": "{{service_namespace}} / {{service_instance_id}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace, service_instance_index) (logline_server_active_connections{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"})", "legendFormat": "{{service_namespace}} / {{service_instance_index}}" }
       ]
     },
     {
@@ -204,7 +204,7 @@
       "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace, result) (rate(logline_server_connections_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} {{result}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace, result) (rate(logline_server_connections_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} {{result}}" }
       ]
     },
     {
@@ -217,8 +217,8 @@
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_bytes_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} received" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_bytes_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} written" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_bytes_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} received" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_bytes_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} written" }
       ]
     },
     {
@@ -231,9 +231,9 @@
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p50" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p95" },
-        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p99" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "p99" }
       ]
     },
     {
@@ -246,7 +246,7 @@
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le, compression) (rate(logline_server_decompress_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "{{compression}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "histogram_quantile(0.95, sum by (le, compression) (rate(logline_server_decompress_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))", "legendFormat": "{{compression}}" }
       ]
     },
     {
@@ -259,7 +259,7 @@
       "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "stacking": { "mode": "normal" } } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (error_type) (rate(logline_server_protocol_errors_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{error_type}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (error_type) (rate(logline_server_protocol_errors_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{error_type}}" }
       ]
     },
     {
@@ -272,7 +272,7 @@
       "fieldConfig": { "defaults": { "unit": "cps", "min": 0, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1 }, "color": { "mode": "fixed", "fixedColor": "red" } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_server_auth_failures_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "auth failures" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_server_auth_failures_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "auth failures" }
       ]
     },
     {
@@ -285,7 +285,7 @@
       "fieldConfig": { "defaults": { "unit": "cps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(logline_server_renames_total{service_namespace=~\"$namespace\",service_instance_id=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{result}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (result) (rate(logline_server_renames_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{result}}" }
       ]
     }
   ]
