@@ -136,13 +136,23 @@ class ClientConnection:
         await wait_for(self.writer.drain(), timeout=socket_timeout)
         reply_line = await wait_for(self.reader.readline(), timeout=socket_timeout)
         #logger.debug('Received reply line %r', reply_line)
+        if not reply_line:
+            # EOF: the server closed the connection before sending a reply line
+            # (e.g. it was shutting down mid-handshake during a rolling
+            # restart). Surface this as a connection error so the caller
+            # reconnects, instead of letting the empty unpack below raise an
+            # opaque ValueError that escapes the segment's retry path and
+            # orphans the file for good.
+            raise ConnectionError('server closed the connection before replying')
         reply_line_parts = reply_line.decode('ascii').split()
         if len(reply_line_parts) == 2:
             reply_status, reply_length = reply_line_parts
             reply_length = int(reply_length)
-        else:
+        elif len(reply_line_parts) == 1:
             reply_status, = reply_line_parts
             reply_length = 0
+        else:
+            raise ClientError('Malformed reply line: {!r}'.format(reply_line))
         if reply_length:
             reply_json = await wait_for(self.reader.readexactly(reply_length), timeout=socket_timeout)
             reply = json.loads(reply_json.decode('utf-8'))

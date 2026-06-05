@@ -32,6 +32,13 @@ logger = getLogger(__name__)
 
 CHUNK_SIZE = 2 ** 20
 
+# A failed reconnect must never permanently orphan a file: retry with a
+# capped exponential backoff so a transient server outage (a rolling restart
+# that briefly refuses connections or closes the handshake) pauses shipping
+# rather than killing the segment.
+RECONNECT_BACKOFF_MIN_SECONDS = 1.0
+RECONNECT_BACKOFF_MAX_SECONDS = 30.0
+
 
 def utc_iso_dt():
     return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -192,9 +199,24 @@ class Segment:
                 self.conn.close()
         except Exception:
             pass
+        self.conn = None
         prefix = self._read_prefix()
-        self.conn = await self.server(
-            log_path=self.file_path, target=self.target, log_prefix=prefix)
+        backoff = RECONNECT_BACKOFF_MIN_SECONDS
+        while True:
+            try:
+                self.conn = await self.server(
+                    log_path=self.file_path, target=self.target, log_prefix=prefix)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Keep retrying instead of letting the failure propagate and
+                # end the segment task: a paused file resumes once the server
+                # is back, an orphaned one stays frozen until the next rotation.
+                logger.warning('Reconnect for %s (target %s) failed: %r; retrying in %.1fs',
+                               self.file_path, self.target, e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
 
     async def _drain_available(self):
         '''Send all currently-readable bytes; return True if anything was sent.'''
@@ -279,6 +301,15 @@ class PathCoordinator:
         try:
             while True:
                 self._reap_closing()
+                if self.live is not None and self.live.task is not None and self.live.task.done():
+                    # The live segment task exited on its own -- an unexpected
+                    # error escaped its reconnect retry loop. Drop it and force
+                    # re-detection below so the file resumes shipping, instead
+                    # of silently freezing until the next rotation creates a
+                    # new inode.
+                    logger.warning('Live segment for %s ended unexpectedly; respawning', self.file_path)
+                    self.live = None
+                    self.last_inode = None
                 inode = self._stat_inode()
                 if inode is not None and inode != self.last_inode:
                     await self._on_new_inode(inode)
