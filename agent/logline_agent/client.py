@@ -14,6 +14,8 @@ from socket import getfqdn
 from ssl import Purpose, create_default_context
 from time import monotonic as monotime
 
+from .telemetry import record_bytes_sent, record_connect, record_frame, record_send_duration
+
 
 logger = getLogger(__name__)
 
@@ -47,9 +49,13 @@ async def connect_to_server(conf, log_path, target, log_prefix):
             cafile=str(conf.tls_cert_file) if conf.tls_cert_file else None)
     else:
         ssl_context = None
-    reader, writer = await wait_for(
-        open_connection(conf.server_host, conf.server_port, ssl=ssl_context),
-        timeout=connect_timeout)
+    try:
+        reader, writer = await wait_for(
+            open_connection(conf.server_host, conf.server_port, ssl=ssl_context),
+            timeout=connect_timeout)
+    except Exception:
+        record_connect('error')
+        raise
     cc = ClientConnection(reader, writer)
     await cc.send_header({
         'hostname': getfqdn(),
@@ -64,6 +70,7 @@ async def connect_to_server(conf, log_path, target, log_prefix):
         },
     })
     assert cc.header_reply
+    record_connect('ok')
     return cc
 
 
@@ -94,6 +101,7 @@ class ClientConnection:
         if len(content_gz) < len(content):
             metadata['compression'] = 'gzip'
             content = content_gz
+        record_bytes_sent(len(content))
         await self._send_command('data', metadata, content)
 
     async def send_rename(self, src, dst):
@@ -141,14 +149,19 @@ class ClientConnection:
             del reply_json
         else:
             reply = None
-        duration_ms = int((monotime() - t0) * 1000)
+        elapsed = monotime() - t0
+        duration_ms = int(elapsed * 1000)
+        record_send_duration(elapsed)
         if reply_status == 'ok':
+            record_frame('ok')
             logger.debug('Received reply in %d ms: %s %s', duration_ms, reply_status, '-' if reply is None else repr(reply))
             return reply
         elif reply_status == 'error':
+            record_frame('error')
             logger.warning('Received reply in %d ms: %s %s', duration_ms, reply_status, '-' if reply is None else repr(reply))
             raise ClientError('Error reply: {}'.format(reply))
         else:
+            record_frame('error')
             raise ClientError('Protocol error')
 
 

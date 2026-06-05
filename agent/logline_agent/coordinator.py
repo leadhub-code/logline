@@ -25,6 +25,7 @@ from os import fstat
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
+from .telemetry import record_bytes_read, record_rotation, register_lag_source, unregister_lag_source
 
 
 logger = getLogger(__name__)
@@ -62,6 +63,7 @@ class Segment:
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self.task = None
+        self._lag = 0                    # bytes readable but not yet shipped
 
     # -- coordinator-facing API --------------------------------------------
 
@@ -84,6 +86,7 @@ class Segment:
     # -- lifecycle ---------------------------------------------------------
 
     async def run(self):
+        register_lag_source(id(self), lambda: self._lag)
         try:
             await self._connect()
             await self._live_phase()
@@ -200,6 +203,7 @@ class Segment:
             pos = self.file_stream.tell()
             chunk = self.file_stream.read(CHUNK_SIZE)
             if not chunk:
+                self._lag = 0
                 return sent_any
             try:
                 await self.conn.send_data(pos, chunk)
@@ -209,7 +213,11 @@ class Segment:
                 await self._reconnect()
                 self.file_stream.seek(self.conn.header_reply['length'])
                 return sent_any
+            # Count only after a successful send: a failed send seeks back and
+            # re-reads these bytes, so counting post-send avoids double-counting.
+            record_bytes_read(len(chunk))
             sent_any = True
+            self._lag = self._stream_lag()
 
     async def _rename(self, src, dst):
         while True:
@@ -231,7 +239,15 @@ class Segment:
         self.file_stream.seek(0)
         return self.file_stream.read(self.conf.prefix_length_bytes)
 
+    def _stream_lag(self):
+        '''Bytes appended to the inode but not yet read by this segment.'''
+        try:
+            return max(0, fstat(self.file_stream.fileno()).st_size - self.file_stream.tell())
+        except OSError:
+            return 0
+
     def _close(self):
+        unregister_lag_source(id(self))
         try:
             if self.conn is not None:
                 self.conn.close()
@@ -286,6 +302,7 @@ class PathCoordinator:
             logger.info('Detected file: %s (inode %s)', self.file_path, f_inode)
         else:
             logger.info('File rotated: %s (inode %s -> %s)', self.file_path, self.last_inode, f_inode)
+            record_rotation()
             await self._seal_live()
         self.live = self._make_segment(f, f_inode, target=self.basename, role_live=True)
         self.live.start()

@@ -93,6 +93,14 @@ class Configuration:
         if not self.client_token_hashes:
             raise ConfigurationError('No client token hashes configured')
 
+        metrics_cfg = cfg.get('metrics') or {}
+        self.metrics_enabled = bool(metrics_cfg.get('enabled'))
+        if os.environ.get('OTEL_SDK_DISABLED', '').strip().lower() == 'true':
+            self.metrics_enabled = False
+        # Endpoint falls back to the standard OTEL_EXPORTER_OTLP_ENDPOINT env var,
+        # then (when left as None) to the SDK's own localhost:4317 default.
+        self.metrics_endpoint = metrics_cfg.get('endpoint') or os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
+
 
 def parse_address(s):
     m = re.match(r'^([^:]+):([0-9]+)$', s)
