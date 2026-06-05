@@ -6,10 +6,10 @@ is a complete no-op and the OpenTelemetry SDK is never imported, so the base
 install stays lean. When on, the SDK is imported lazily and the process exports
 delta-temporality metric streams over OTLP to a local collector.
 
-``host.name`` is a resource attribute (a single fixed value per process), so
-per-host dashboards are free without paying for a per-metric label. Several
-agents may run on one host; a fresh ``service.instance.id`` per process keeps
-their streams distinct.
+``host.name`` is left to the local collector by default (its resource detection
+adds the host's name), and is only attached here when explicitly configured.
+Several agents may run on one host; a fresh ``service.instance.id`` per process
+keeps their streams distinct.
 '''
 
 from logging import getLogger

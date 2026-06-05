@@ -55,10 +55,10 @@ def init_metrics(conf):
                        'metrics stay off. Install the "otel" extra to enable them.')
         return None
 
-    resource = Resource.create({
-        'service.name': SERVICE_NAME,
-        'service.instance.id': str(uuid.uuid4()),
-    })
+    attrs = {'service.name': SERVICE_NAME, 'service.instance.id': str(uuid.uuid4())}
+    if conf.metrics_host_name:
+        attrs['host.name'] = conf.metrics_host_name
+    resource = Resource.create(attrs)
     exporter_kwargs = {
         'preferred_temporality': {
             Counter: AggregationTemporality.DELTA,

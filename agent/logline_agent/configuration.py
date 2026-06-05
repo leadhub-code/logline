@@ -2,7 +2,6 @@ from logging import getLogger
 import os
 from pathlib import Path
 import re
-from socket import getfqdn
 
 import yaml
 
@@ -118,9 +117,11 @@ class Configuration:
         # Endpoint falls back to the standard OTEL_EXPORTER_OTLP_ENDPOINT env var,
         # then (when left as None) to the SDK's own localhost:4317 default.
         self.metrics_endpoint = metrics_cfg.get('endpoint') or os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
-        # host.name is a resource attribute (fixed per process), so per-host
-        # dashboards cost nothing and the hostname never becomes a metric label.
-        self.metrics_host_name = getfqdn() if self.metrics_enabled else None
+        # host.name is normally supplied by the local OTel collector, whose
+        # resource detection fills in (and overrides) the host's DNS name, so we
+        # do not set it here. Allow an explicit override for deployments that
+        # export without such a collector in front.
+        self.metrics_host_name = (metrics_cfg.get('host_name') or os.environ.get('LOGLINE_HOST_NAME')) if self.metrics_enabled else None
 
 
 def parse_address(s):

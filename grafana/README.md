@@ -25,8 +25,12 @@ panel `expr` fields.
 
 ## Labels and filtering
 
-Every process exports a unique `service_instance_id`, and agents also carry
+Every process exports a unique `service_instance_id`; the collector adds
 `host_name`. Several agents on one host share a `host_name` but stay distinct by
-`service_instance_id`; several server instances behind one port are likewise
-distinct by `service_instance_id`. The dashboard has **Host** and **Server
-instance** template variables built on those labels.
+`service_instance_id`. Server deployments that share a host (each typically a
+group of `reuse_port` containers) are told apart by `service_namespace`, set per
+container group via `OTEL_RESOURCE_ATTRIBUTES=service.namespace=<name>`; the
+`reuse_port` containers within a group are then separated by `service_instance_id`.
+
+The dashboard has **Host**, **Server namespace**, and **Server instance**
+template variables built on those labels.

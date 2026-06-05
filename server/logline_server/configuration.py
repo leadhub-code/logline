@@ -100,6 +100,11 @@ class Configuration:
         # Endpoint falls back to the standard OTEL_EXPORTER_OTLP_ENDPOINT env var,
         # then (when left as None) to the SDK's own localhost:4317 default.
         self.metrics_endpoint = metrics_cfg.get('endpoint') or os.environ.get('OTEL_EXPORTER_OTLP_ENDPOINT')
+        # Optional host.name override. The server normally leaves host.name unset
+        # and lets the collector's resource detection supply the real host; set
+        # this only when running where that detection is unavailable or wrong
+        # (e.g. a container without host networking).
+        self.metrics_host_name = (metrics_cfg.get('host_name') or os.environ.get('LOGLINE_HOST_NAME')) if self.metrics_enabled else None
 
 
 def parse_address(s):

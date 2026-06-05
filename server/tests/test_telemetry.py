@@ -6,7 +6,7 @@ from logline_server import telemetry
 
 
 def test_disabled_returns_none_and_helpers_are_noops():
-    conf = SimpleNamespace(metrics_enabled=False, metrics_endpoint=None)
+    conf = SimpleNamespace(metrics_enabled=False, metrics_endpoint=None, metrics_host_name=None)
     assert telemetry.init_metrics(conf) is None
     # None of the call-site helpers should do anything (or raise) while disabled.
     telemetry.record_connection('ok')
@@ -26,7 +26,7 @@ def test_enabled_builds_provider_and_records(monkeypatch):
     pytest.importorskip('opentelemetry')
     # Cap the OTLP timeout so the shutdown flush against a dead endpoint is quick.
     monkeypatch.setenv('OTEL_EXPORTER_OTLP_TIMEOUT', '1')
-    conf = SimpleNamespace(metrics_enabled=True, metrics_endpoint='http://localhost:4317')
+    conf = SimpleNamespace(metrics_enabled=True, metrics_endpoint='http://localhost:4317', metrics_host_name=None)
     provider = telemetry.init_metrics(conf)
     assert provider is not None
     try:
