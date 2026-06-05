@@ -128,8 +128,8 @@
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_read_bytes_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "read (uncompressed)" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_sent_wire_bytes_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "wire (compressed)" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_read_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "read (uncompressed)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum(rate(logline_agent_bytes_sent_wire_total{host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "wire (compressed)" }
       ]
     },
     {
@@ -217,8 +217,8 @@
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1 } }, "overrides": [] },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_bytes_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} received" },
-        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_bytes_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} written" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} received" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }, "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))", "legendFormat": "{{service_namespace}} written" }
       ]
     },
     {
