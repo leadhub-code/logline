@@ -140,6 +140,17 @@ every `ack_interval` seconds (and on graceful close). The agent keeps the total
 of unacknowledged `DATA` bytes below its configured window; when the window is
 full it stops reading new data until an `ACK` advances the acknowledged offset.
 
-**Heartbeats.** If either side has sent nothing for `heartbeat_interval`
-seconds it sends a `HEARTBEAT`. If a peer receives nothing at all for
-`idle_timeout` seconds it considers the connection dead and closes it.
+**Heartbeats.** Each side sends a `HEARTBEAT` every `heartbeat_interval`
+seconds. If a peer receives nothing at all (data or heartbeat) for
+`idle_timeout` seconds it considers the connection dead and closes it, so
+`heartbeat_interval` must be well below `idle_timeout`.
+
+**In-place truncation.** logline/2 mirrors append-only files. Rename-based
+rotation is detected reliably (the agent sees a new inode and opens a new
+stream; the server's prefix check rotates the mirror aside). Truncating a
+watched file *in place* (same inode, e.g. `> file` or a `copytruncate`-style
+rotation) is only partially handled: if the refilled file shares its prefix
+with the old one the server cannot tell it apart from a resume and keeps the
+existing mirror. The agent never seeks past end of file, so it does not
+corrupt data, but such a file may stop being mirrored faithfully until it is
+rename-rotated. Prefer rename-based rotation.

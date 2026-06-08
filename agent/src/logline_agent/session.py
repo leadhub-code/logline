@@ -70,7 +70,8 @@ class Stream:
         self.open_ack = Future()   # resolved with the server's start offset
         self.sent_offset = 0
         self.acked_offset = 0
-        self.ack_event = Event()   # set whenever acked_offset advances
+        self.ack_event = Event()      # set whenever acked_offset advances
+        self.server_closed = Event()  # set if the server closes or errors this stream
 
     def on_ack(self, offset):
         if offset > self.acked_offset:
@@ -180,14 +181,27 @@ class AgentSession:
                 stream.open_ack.set_result(json.loads(payload)['offset'])
         elif frame_type == HEARTBEAT:
             pass
-        elif frame_type == ERROR:
-            logger.error('Server error: %s', json.loads(payload))
-            self.closed.set()
-        elif frame_type == CLOSE:
-            logger.info('Server is closing the connection')
-            self.closed.set()
+        elif frame_type in (ERROR, CLOSE):
+            self._handle_peer_close(frame_type, stream_id, json.loads(payload) if payload else {})
         else:
             logger.warning('Unexpected frame from server: %s', frame_type_name(frame_type))
+
+    def _handle_peer_close(self, frame_type, stream_id, info):
+        if stream_id == CONNECTION_STREAM:
+            if frame_type == ERROR:
+                logger.error('Server error: %s', info)
+            else:
+                logger.info('Server is closing the connection')
+            self.closed.set()
+            return
+        # Stream-level close/error: stop just this stream, keep the connection.
+        logger.warning('Server %s stream %d: %s', 'errored' if frame_type == ERROR else 'closed', stream_id, info)
+        stream = self.streams.get(stream_id)
+        if stream is not None:
+            stream.server_closed.set()
+            stream.ack_event.set()  # wake any window wait so the tail task can stop
+            if not stream.open_ack.done():
+                stream.open_ack.set_exception(ProtocolError(f'Server closed stream {stream_id}'))
 
     async def _scanner_loop(self):
         while not self.closed.is_set():
@@ -232,57 +246,94 @@ class AgentSession:
                 stream = self._open_stream(path, prefix)
                 try:
                     start_offset = await wait_for(stream.open_ack, timeout=self.conf.idle_timeout)
+                    start_offset = self._resume_offset(path, f, start_offset)
+                    # Seed the offsets to where we actually resume, so DATA frames
+                    # carry the true file offset and the window math is correct.
+                    stream.sent_offset = start_offset
+                    stream.acked_offset = start_offset
                     f.seek(start_offset)
                     logger.info('Tailing %s on stream %d from offset %d', path, stream.stream_id, start_offset)
                     await self._pump_file(path, f, inode, stream)
                 finally:
                     self._close_stream(stream)
+                if stream.server_closed.is_set():
+                    # The server rejected this stream; back off before retrying.
+                    await self._sleep(self.conf.tail_read_interval)
             finally:
                 f.close()
 
     async def _pump_file(self, path, f, inode, stream):
         '''Ship data from f until the file is rotated, truncated, or we stop.'''
         last_active = monotime()
-        while not self.closed.is_set():
+        while not self.closed.is_set() and not stream.server_closed.is_set():
             await self._wait_for_window(stream)
-            if self.closed.is_set():
+            if self.closed.is_set() or stream.server_closed.is_set():
                 return
             chunk = f.read(self.conf.chunk_size)
             if chunk:
                 await self._send_data(stream, chunk)
                 last_active = monotime()
                 continue
-            if self._rotated_or_truncated(path, f, inode):
+            change = self._file_change(path, f, inode)
+            if change == 'rotated':
+                logger.info('File rotated, draining and closing stream %d (%s)', stream.stream_id, path)
+                await self._drain(f, stream)
+                return
+            if change == 'truncated':
+                logger.info('File truncated, restarting stream %d (%s)', stream.stream_id, path)
                 return
             if monotime() - last_active > self.conf.rotated_files_inactivity_threshold and not path.exists():
                 logger.info('File gone and idle, dropping stream %d (%s)', stream.stream_id, path)
                 return
             await self._sleep(self.conf.tail_read_interval)
 
+    async def _drain(self, f, stream):
+        '''Ship whatever is still readable from a rotated file's old handle.'''
+        while not self.closed.is_set() and not stream.server_closed.is_set():
+            chunk = f.read(self.conf.chunk_size)
+            if not chunk:
+                return
+            await self._wait_for_window(stream)
+            if self.closed.is_set() or stream.server_closed.is_set():
+                return
+            await self._send_data(stream, chunk)
+
     async def _wait_for_window(self, stream):
-        while not self.closed.is_set():
+        while not self.closed.is_set() and not stream.server_closed.is_set():
             if stream.sent_offset - stream.acked_offset < self.conf.window_bytes:
                 return
             stream.ack_event.clear()
             if stream.sent_offset - stream.acked_offset < self.conf.window_bytes:
                 return
-            try:
-                await wait_for(stream.ack_event.wait(), timeout=self.conf.idle_timeout)
-            except TimeoutError:
-                raise ProtocolError(f'No ACK for stream {stream.stream_id} within idle timeout')
+            # Wait for an ACK to advance the window. A slow server is not an
+            # error here; a truly dead peer is caught by the reader idle timeout.
+            with suppress(TimeoutError):
+                await wait_for(stream.ack_event.wait(), timeout=1.0)
 
-    def _rotated_or_truncated(self, path, f, inode):
+    def _resume_offset(self, path, f, start_offset):
+        file_size = fstat(f.fileno()).st_size
+        if start_offset > file_size:
+            # The server holds more than the local file -- it was likely
+            # truncated in place. Resume from what we have rather than seeking
+            # past EOF; bytes the server has beyond our size cannot be
+            # reconciled without a protocol-level reset (see Protocol.md).
+            logger.warning(
+                'Server offset %d is past local size %d for %s; resuming from %d',
+                start_offset, file_size, path, file_size)
+            return file_size
+        return start_offset
+
+    def _file_change(self, path, f, inode):
+        '''Return 'rotated', 'truncated', or None for the watched file.'''
         try:
             current_inode = path.stat().st_ino
         except FileNotFoundError:
-            return False  # gone for now; handled by the inactivity check
+            return None  # gone for now; handled by the inactivity check
         if current_inode != inode:
-            logger.info('File rotated (inode %s -> %s): %s', inode, current_inode, path)
-            return True
+            return 'rotated'
         if fstat(f.fileno()).st_size < f.tell():
-            logger.info('File truncated: %s', path)
-            return True
-        return False
+            return 'truncated'
+        return None
 
     async def _send_data(self, stream, chunk):
         offset = stream.sent_offset
@@ -313,7 +364,7 @@ class AgentSession:
 
     def _close_stream(self, stream):
         self.streams.pop(stream.stream_id, None)
-        if not self.closed.is_set():
+        if not self.closed.is_set() and not stream.server_closed.is_set():
             payload = json.dumps({'reason': 'stream closed'}).encode()
             self.send_queue.put_nowait(encode_frame(CLOSE, stream.stream_id, payload))
 

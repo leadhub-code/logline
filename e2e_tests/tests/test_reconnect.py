@@ -48,3 +48,32 @@ def test_resume_after_server_restart(tmp_path):
         # with no gaps and no duplicates.
         with run_server(dst, port):
             wait_for_bytes(target, first + second, timeout=15)
+
+
+def test_resume_from_nonzero_offset(tmp_path):
+    chdir(tmp_path)
+    src = Path('src')
+    src.mkdir()
+    dst = Path('dst')
+    dst.mkdir()
+    log = src / 'big.log'
+    # Larger than the 256 B prefix, so on reconnect the prefix still matches and
+    # the server resumes at a NON-ZERO offset without rotating. This is the case
+    # that requires the agent to seed sent/acked offsets to the resume point;
+    # otherwise the appended bytes would be sent with offset 0 and dropped as
+    # duplicates by the server, and never persisted.
+    first = b'A' * 600 + b'\n'
+    second = b'B' * 600 + b'\n'
+    log.write_bytes(first)
+    port = free_port()
+    conf = tmp_path / 'agent.yaml'
+    write_agent_conf(conf, src, port)
+    target = dst_path(dst, src, 'big.log')
+
+    with running_process(['logline-agent', '--conf', str(conf), '-v']):
+        with run_server(dst, port):
+            wait_for_bytes(target, first, timeout=10)
+        with log.open('ab') as f:
+            f.write(second)
+        with run_server(dst, port):
+            wait_for_bytes(target, first + second, timeout=15)

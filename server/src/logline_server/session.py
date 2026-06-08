@@ -129,16 +129,33 @@ class ServerSession:
             ack_interval=self.conf.ack_interval))
 
     async def _dispatch(self, frame_type, stream_id, payload):
-        if frame_type == DATA:
-            await self._handle_data(stream_id, payload)
-        elif frame_type == OPEN:
-            self._handle_open(stream_id, payload)
-        elif frame_type == HEARTBEAT:
-            pass  # liveness only; receiving any frame already refreshes the read timeout
-        elif frame_type == CLOSE:
-            self._handle_close(stream_id, payload)
-        else:
-            raise ProtocolError(f'Unexpected frame: {frame_type_name(frame_type)}')
+        try:
+            if frame_type == DATA:
+                await self._handle_data(stream_id, payload)
+            elif frame_type == OPEN:
+                self._handle_open(stream_id, payload)
+            elif frame_type == HEARTBEAT:
+                pass  # liveness only; receiving any frame already refreshes the read timeout
+            elif frame_type == CLOSE:
+                self._handle_close(stream_id, payload)
+            else:
+                raise ProtocolError(f'Unexpected frame: {frame_type_name(frame_type)}')
+        except ProtocolError as e:
+            # A connection-level violation tears the connection down; a
+            # stream-level one only closes that stream, so one bad file does
+            # not take down every other stream multiplexed on this connection.
+            if stream_id == CONNECTION_STREAM:
+                raise
+            logger.warning('Error on stream %d, closing it: %s', stream_id, e)
+            self._fail_stream(stream_id, str(e))
+
+    def _fail_stream(self, stream_id, message):
+        sink = self.sinks.pop(stream_id, None)
+        self.acked.pop(stream_id, None)
+        if sink is not None:
+            with suppress(Exception):
+                sink.close()
+        self._enqueue_control(ERROR, stream_id, Error(code='stream_error', message=message))
 
     def _handle_open(self, stream_id, payload):
         if stream_id == CONNECTION_STREAM:
@@ -178,7 +195,13 @@ class ServerSession:
         while not self.closing.is_set():
             await self._sleep(self.conf.ack_interval)
             for stream_id, sink in list(self.sinks.items()):
-                self._ack_stream(stream_id, sink)
+                try:
+                    self._ack_stream(stream_id, sink)
+                except Exception as e:
+                    # A failing sink (e.g. fsync ENOSPC/EIO) must not kill the
+                    # acker for every other stream on this connection.
+                    logger.warning('Failed to ack/sync stream %d, closing it: %r', stream_id, e)
+                    self._fail_stream(stream_id, f'sink error: {e}')
 
     def _ack_stream(self, stream_id, sink):
         if sink.offset == self.acked.get(stream_id):
