@@ -59,7 +59,7 @@ def server_main():
     args = p.parse_args()
     setup_logging(verbose=args.verbose)
     conf = Configuration(args=args)
-    setup_log_file(conf.log_file)
+    setup_log_file(conf.log_file, conf.log_file_level)
     run(async_main(conf))
 
 
@@ -78,12 +78,12 @@ def setup_logging(verbose):
     stderr_log_handler = h
 
 
-def setup_log_file(log_file_path):
+def setup_log_file(log_file_path, level=DEBUG):
     if not log_file_path:
         return
     h = WatchedFileHandler(str(log_file_path))
     h.setFormatter(Formatter(log_format))
-    h.setLevel(DEBUG)
+    h.setLevel(level)
     getLogger('').addHandler(h)
     if stderr_log_handler:
         # decrease stderr handler level since we are logging into file instead
@@ -129,7 +129,7 @@ async def handle_client(conf, reader, writer):
     active_connection_inc()
     try:
         addr = writer.get_extra_info('peername')
-        logger.info('New client has connected: %s', addr)
+        logger.debug('New client has connected: %s', addr)
         try:
             command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
         except ReceivedHTTPRequestError:
@@ -195,14 +195,14 @@ async def handle_client(conf, reader, writer):
         # A clean socket close is the normal end of a connection: agents close and
         # reconnect routinely (on every send retry and every rename), so this is
         # not an error and must not inflate the connection / protocol-error counters.
-        logger.info('Client closed connection')
+        logger.debug('Client closed connection')
     except Exception as e:
         logger.exception('Failed to handle client: %r', e)
         result = 'error'
     finally:
         record_connection(result)
         active_connection_dec()
-        logger.info('Closing connection')
+        logger.debug('Closing connection')
         writer.close()
 
 
