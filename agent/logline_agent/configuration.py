@@ -1,4 +1,4 @@
-from logging import getLogger
+from logging import DEBUG, INFO, getLogger
 import os
 from pathlib import Path
 import re
@@ -7,6 +7,8 @@ import yaml
 
 
 logger = getLogger(__name__)
+
+LOG_FILE_LEVELS = {'debug': DEBUG, 'info': INFO}
 
 
 class ConfigurationError (Exception):
@@ -28,12 +30,15 @@ class Configuration:
         else:
             cfg = {}
 
+        log_cfg = cfg.get('log') or {}
         if args.log:
             self.log_file = Path(args.log)
-        elif cfg.get('log', {}).get('file'):
-            self.log_file = cfg_dir / cfg['log']['file']
+        elif log_cfg.get('file'):
+            self.log_file = cfg_dir / log_cfg['file']
         else:
             self.log_file = None
+
+        self.log_file_level = parse_log_file_level(log_cfg.get('level'))
 
         self.scan_globs = []
         if args.scan:
@@ -122,6 +127,16 @@ class Configuration:
         # do not set it here. Allow an explicit override for deployments that
         # export without such a collector in front.
         self.metrics_host_name = (metrics_cfg.get('host_name') or os.environ.get('LOGLINE_HOST_NAME')) if self.metrics_enabled else None
+
+
+def parse_log_file_level(value):
+    if not value:
+        return INFO
+    try:
+        return LOG_FILE_LEVELS[str(value).strip().lower()]
+    except KeyError:
+        raise ConfigurationError('Unknown log level: {!r} (expected one of {})'.format(
+            value, ', '.join(sorted(LOG_FILE_LEVELS))))
 
 
 def parse_address(s):

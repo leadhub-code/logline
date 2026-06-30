@@ -32,7 +32,7 @@ def agent_main():
     args = get_argument_parser().parse_args()
     setup_logging(verbose=args.verbose)
     conf = Configuration(args=args)
-    setup_log_file(conf.log_file)
+    setup_log_file(conf.log_file, conf.log_file_level)
     logger.info('Logline Agent starting')
     try:
         run(async_main(conf))
@@ -61,12 +61,12 @@ def setup_logging(verbose):
     stderr_log_handler = h
 
 
-def setup_log_file(log_file_path):
+def setup_log_file(log_file_path, level=DEBUG):
     if not log_file_path:
         return
     h = WatchedFileHandler(str(log_file_path))
     h.setFormatter(Formatter(log_format))
-    h.setLevel(DEBUG)
+    h.setLevel(level)
     getLogger('').addHandler(h)
     own_log_files.add(Path(log_file_path).resolve())
     if stderr_log_handler:
