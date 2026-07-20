@@ -12,6 +12,34 @@ Consists of two pieces:
 
 The TCP connection can be encrypted via SSL/TLS – using a certificate for example from LetsEncrypt.org or a self-signed one.
 
+Authentication
+--------------
+
+Agents authenticate to the server with a shared secret client token. Logline
+does not generate this token for you – pick your own random string, for
+example with `openssl rand -hex 32`.
+
+Configure it on the **agent** via one of (checked in this order):
+
+- `--token-file <path>` command-line option
+- `CLIENT_TOKEN` environment variable
+- `client_token` in the agent's config file
+- `client_token_file` in the agent's config file (path relative to the config file)
+
+The **server** never stores the raw token, only its SHA-1 hex digest. Compute
+it with:
+
+```
+echo -n 'your-secret-token' | sha1sum
+```
+
+and configure it via `client_token_hashes` (a list) in the server's config
+file, or repeated `--client-token-hash` options. Multiple hashes can be
+configured at once, so tokens can be issued per agent and rotated or revoked
+individually. If a connecting agent's token doesn't match, the server logs
+the hash it computed for the rejected token, which is convenient when
+provisioning a new agent.
+
 Scaling the server
 ------------------
 
