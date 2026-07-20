@@ -91,7 +91,7 @@ def init_metrics(conf):
     _rotations = meter.create_counter(
         'logline.agent.rotations', unit='1', description='Detected log file rotations')
     meter.create_observable_gauge(
-        'logline.agent.files_watched', callbacks=[_observe_files_watched], unit='1',
+        'logline.agent.files_watched', callbacks=[_observe_files_watched],
         description='Files currently being tailed')
     meter.create_observable_gauge(
         'logline.agent.shipping_lag', callbacks=[_observe_shipping_lag], unit='By',

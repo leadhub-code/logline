@@ -51,10 +51,10 @@
           "type": "prometheus",
           "uid": "${DS_PROMETHEUS}"
         },
-        "definition": "label_values(logline_agent_files_watched_ratio, host_name)",
+        "definition": "label_values(logline_agent_files_watched, host_name)",
         "query": {
           "qryType": 1,
-          "query": "label_values(logline_agent_files_watched_ratio, host_name)",
+          "query": "label_values(logline_agent_files_watched, host_name)",
           "refId": "host"
         },
         "refresh": 2,
@@ -191,7 +191,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(logline_agent_files_watched_ratio{host_name=~\"$host\"})",
+          "expr": "sum(logline_agent_files_watched{host_name=~\"$host\"})",
           "legendFormat": "files"
         }
       ]
