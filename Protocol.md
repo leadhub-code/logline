@@ -82,4 +82,16 @@ foo.log                                  (live segment)
 foo.log.<iso_dt>                         (sealed, draining to completion)
 foo.log.<iso_dt>.<sha13>                 (finalized lh-logrotate segment)
 foo.log.<iso_dt>.orphan                  (markerless rotation, no archived counterpart)
+foo.log.orphan                           (markerless rotation of an ephemeral source)
 ```
+
+Sources configured as **ephemeral** in the agent (see the agent's `ephemeral`
+config key) rotate frequently without lh-logrotate markers — Docker's
+`json-file` driver, which self-rotates every few minutes, is the motivating
+case. For these, a markerless rotation seals to the fixed name `foo.log.orphan`
+with **no timestamp**. Because the server's rename clobbers an existing
+destination (POSIX `rename`), each rotation overwrites the previous orphan, so
+the server holds at most two files per source: the live `foo.log` and the last
+sealed `foo.log.orphan`. Marker-based (lh-logrotate) rotations of ephemeral
+sources are unaffected and keep the `<iso_dt>`/`<sha13>` naming above. This is a
+purely agent-side naming choice; the server and protocol are unchanged.

@@ -40,6 +40,31 @@ individually. If a connecting agent's token doesn't match, the server logs
 the hash it computed for the rejected token, which is convenient when
 provisioning a new agent.
 
+Ephemeral log sources
+---------------------
+
+Most rotations are driven by lh-logrotate, which drops marker files the agent
+reads to name each archived segment. Some sources rotate on their own, without
+any markers — most notably Docker's `json-file` logging driver
+(`/var/lib/docker/containers/<id>/<id>-json.log`), which self-rotates every few
+minutes. Each such markerless rotation is sealed server-side as an *orphan*, and
+by default every orphan gets a unique timestamped name, so they accumulate
+unboundedly per source.
+
+Mark these sources as **ephemeral** in the agent's config file with a list of
+glob patterns (matched against the resolved file path):
+
+```yaml
+ephemeral:
+  - /var/lib/docker/containers/*/*-json.log
+```
+
+A markerless rotation of an ephemeral source is sealed under the fixed name
+`<basename>.orphan` (no timestamp). Each rotation overwrites the previous orphan,
+so the server keeps at most two files per source — the live file and the last
+sealed segment — instead of an ever-growing pile. Marker-based (lh-logrotate)
+rotations of an ephemeral source are unaffected.
+
 Scaling the server
 ------------------
 
