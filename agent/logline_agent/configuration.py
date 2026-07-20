@@ -56,6 +56,12 @@ class Configuration:
             self.exclude_globs.extend(cfg['exclude'])
         logger.debug('exclude_globs: %r', self.exclude_globs)
 
+        self.ephemeral_globs = []
+        if cfg.get('ephemeral'):
+            assert isinstance(cfg['ephemeral'], list)
+            self.ephemeral_globs.extend(cfg['ephemeral'])
+        logger.debug('ephemeral_globs: %r', self.ephemeral_globs)
+
         self.exclude_if_file_present = []
         if cfg.get('exclude_if_file_present'):
             assert isinstance(cfg['exclude_if_file_present'], list)

@@ -20,6 +20,7 @@ rename's ack before it starts the new live segment.
 import asyncio
 from asyncio import create_task
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 from logging import getLogger
 from os import fstat
 
@@ -44,6 +45,19 @@ def utc_iso_dt():
     return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
 
+class _EndSegment(Exception):
+    '''
+    Raised to end an ephemeral orphan segment without a reconnect-resume.
+
+    An ephemeral source seals markerless rotations under the fixed name
+    ``<basename>.orphan`` (no timestamp), so successive rotations clobber the same
+    server-side file. Once such a segment is sealing/closing, its target name is
+    no longer unique, and reconnecting would risk resuming onto a *newer* orphan
+    (offset taken from the wrong file, stale bytes interleaved). The data of a
+    sealed orphan is end-of-life, so we fail closed instead: log and end.
+    '''
+
+
 class Segment:
     '''
     One server connection bound to one inode and one explicit ``target`` name.
@@ -55,7 +69,7 @@ class Segment:
     '''
 
     def __init__(self, conf, server, file_path, file_stream, inode, target, markers,
-                 role_live, is_own_log=False):
+                 role_live, is_own_log=False, ephemeral=False):
         self.conf = conf
         self.server = server
         self.file_path = file_path
@@ -65,10 +79,12 @@ class Segment:
         self.markers = markers
         self.role_live = role_live
         self.is_own_log = is_own_log
+        self.ephemeral = ephemeral
 
         self.conn = None
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
+        self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
         self.task = None
         self._lag = 0                    # bytes readable but not yet shipped
 
@@ -101,6 +117,9 @@ class Segment:
             await self._closing_phase()
         except asyncio.CancelledError:
             raise
+        except _EndSegment:
+            # Expected end-of-life for an ephemeral orphan segment; already logged.
+            pass
         except Exception as e:
             logger.exception('Segment %s (target %s) failed: %r', self.file_path, self.target, e)
         finally:
@@ -121,7 +140,14 @@ class Segment:
         seal_name, is_orphan, iso_dt = self._pending_seal
         # flush whatever is already readable before relabelling
         await self._drain_available()
-        await self._rename(self.target, seal_name)
+        # The pre-rename drain above targets our own still-unique live name, so it
+        # keeps normal reconnect-resume semantics. The rename itself is different:
+        # for an ephemeral orphan the destination is the shared fixed
+        # `<basename>.orphan`, which a later rotation may already have clobbered
+        # with a newer segment. The generic `_rename` retry reconnects to the
+        # destination and treats "it exists" as success -- unsafe here, since we
+        # could adopt (and resume onto) that newer file. So we fail closed.
+        await self._rename(self.target, seal_name, fail_closed=self.ephemeral and is_orphan)
         logger.info('Sealed %s as %s', self.file_path, seal_name)
         self.target = seal_name
         self.role_live = False
@@ -130,6 +156,10 @@ class Segment:
     async def _closing_phase(self):
         seal_name, is_orphan, iso_dt = self._pending_seal
         if is_orphan:
+            # An ephemeral orphan now carries the fixed, non-unique
+            # `<basename>.orphan` target; reconnecting mid-drain could resume onto
+            # a newer orphan, so end the segment on any failure instead.
+            self._no_resume = self.ephemeral
             await self._drain_until_idle()
             logger.info('Closing orphan segment %s (target %s)', self.file_path, self.target)
         else:
@@ -183,7 +213,12 @@ class Segment:
         We have no source for its trailing bytes, so seal it aside as an orphan,
         then reconnect to the now-free live target and stream our inode.
         '''
-        seal_name = '{}.{}.orphan'.format(self.target, utc_iso_dt())
+        # Ephemeral sources use the fixed `<target>.orphan` name so successive
+        # recoveries clobber one file instead of piling up timestamped orphans.
+        if self.ephemeral:
+            seal_name = '{}.orphan'.format(self.target)
+        else:
+            seal_name = '{}.{}.orphan'.format(self.target, utc_iso_dt())
         logger.info('Recovery: live target %s holds a different file (len %d); sealing as %s',
                     self.target, server_length, seal_name)
         # This connection's server-side fd follows the rename onto the sealed
@@ -230,6 +265,11 @@ class Segment:
             try:
                 await self.conn.send_data(pos, chunk)
             except Exception as e:
+                if self._no_resume:
+                    logger.warning('send_data on ephemeral orphan %s (target %s) failed: %r; '
+                                   'ending segment without resume (its data is end-of-life)',
+                                   self.file_path, self.target, e)
+                    raise _EndSegment() from e
                 logger.warning('send_data on %s (target %s) failed: %r; reconnecting',
                                self.file_path, self.target, e)
                 await self._reconnect()
@@ -241,12 +281,22 @@ class Segment:
             sent_any = True
             self._lag = self._stream_lag()
 
-    async def _rename(self, src, dst):
+    async def _rename(self, src, dst, fail_closed=False):
         while True:
             try:
                 await self.conn.send_rename(src, dst)
                 return
             except Exception as e:
+                if fail_closed:
+                    # The reconnect-to-destination recovery below assumes `dst` is
+                    # unique to this segment. A fixed `<basename>.orphan` is not:
+                    # `dst` existing may be a *newer* rotation's orphan, not our
+                    # rename applied. Adopting it would resume onto the wrong file,
+                    # so give up and end the segment instead.
+                    logger.warning('seal rename %s -> %s on %s failed: %r; ending segment '
+                                   '(fixed orphan name is unsafe to resume onto)',
+                                   src, dst, self.file_path, e)
+                    raise _EndSegment() from e
                 logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
                                src, dst, self.file_path, e)
                 # Reconnect targeting the destination: the rename may already be
@@ -290,6 +340,11 @@ class PathCoordinator:
         self.basename = file_path.name
         self.server = server
         self.is_own_log = is_own_log
+        # A source is "ephemeral" when its resolved path matches one of the
+        # configured globs. Ephemeral sources rotate without lh-logrotate markers
+        # (e.g. Docker's json-file driver), so their markerless orphans use a
+        # fixed name that each rotation overwrites instead of accumulating.
+        self.ephemeral = any(fnmatch(str(file_path), pattern) for pattern in conf.ephemeral_globs)
         self.markers = MarkerWatcher(conf, file_path.parent, file_path.name)
         self.live = None
         self.closing = set()
@@ -341,9 +396,14 @@ class PathCoordinator:
     async def _seal_live(self):
         '''Seal the current live segment and move it to the closing set.'''
         iso_dt, is_orphan = await self._learn_iso_dt()
-        seal_name = '{}.{}'.format(self.basename, iso_dt)
-        if is_orphan:
-            seal_name += '.orphan'
+        if is_orphan and self.ephemeral:
+            # Ephemeral markerless rotation: fixed name, no timestamp, so the
+            # server's clobbering rename keeps at most one orphan per source.
+            seal_name = '{}.orphan'.format(self.basename)
+        elif is_orphan:
+            seal_name = '{}.{}.orphan'.format(self.basename, iso_dt)
+        else:
+            seal_name = '{}.{}'.format(self.basename, iso_dt)
         self.live.request_seal(seal_name, is_orphan, iso_dt)
         await self.live.wait_sealed()   # ordering: seal acked before new live opens
         self.consumed_isos.add(iso_dt)
@@ -367,7 +427,7 @@ class PathCoordinator:
     def _make_segment(self, f, inode, target, role_live):
         return Segment(
             self.conf, self.server, self.file_path, f, inode, target,
-            self.markers, role_live, is_own_log=self.is_own_log)
+            self.markers, role_live, is_own_log=self.is_own_log, ephemeral=self.ephemeral)
 
     def _reap_closing(self):
         done = {s for s in self.closing if s.task is not None and s.task.done()}

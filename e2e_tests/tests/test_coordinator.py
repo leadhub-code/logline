@@ -30,14 +30,15 @@ def make_server_conf(dest_dir):
     )
 
 
-def make_agent_conf(port):
+def make_agent_conf(port, ephemeral_globs=()):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
         prefix_length_bytes=50, min_prefix_length_bytes=20,
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
-        seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2)
+        seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
+        ephemeral_globs=list(ephemeral_globs))
 
 
 def dst_dir_for(dst, src):
@@ -181,6 +182,39 @@ def test_orphan_rotation_without_markers(tmp_path):
             # trailing component is the literal 'orphan'
             assert orphan.name.startswith('foo.log.')
             assert orphan.name.endswith('.orphan')
+            # a non-ephemeral source keeps the timestamped name, not the fixed one
+            assert orphan.name != 'foo.log.orphan'
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_ephemeral_orphan_uses_fixed_name_and_overwrites(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.ephemeral_globs = [str(src.resolve() / '*.log')]
+        foo = src / 'foo.log'
+        foo.write_bytes(b'body one\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'body one\n')
+
+            # first markerless rotation -> fixed foo.log.orphan holds 'body one'
+            rotate_aside(src, 'foo.log', ISO)
+            foo.write_bytes(b'body two\n')
+            orphan = d / 'foo.log.orphan'
+            await wait_until(lambda: orphan.read_bytes() == b'body one\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'body two\n')
+
+            # second markerless rotation -> the same fixed name is overwritten
+            rotate_aside(src, 'foo.log', ISO + '-2')
+            foo.write_bytes(b'body three\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'body three\n')
+            await wait_until(lambda: orphan.read_bytes() == b'body two\n')
+
+            # exactly the live file plus a single fixed-name orphan remain
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', 'foo.log.orphan']
         finally:
             await cancel(task)
 
