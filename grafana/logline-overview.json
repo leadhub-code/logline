@@ -83,7 +83,7 @@
         },
         "refresh": 2,
         "includeAll": true,
-        "multi": true,
+        "multi": false,
         "allValue": ".*",
         "current": {
           "text": "All",
