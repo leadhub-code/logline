@@ -433,7 +433,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(logline_agent_frames_total{result=\"error\",host_name=~\"$host\"}[$__rate_interval])) / clamp_min(sum(rate(logline_agent_frames_total{host_name=~\"$host\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(logline_agent_frames_total{result=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(logline_agent_frames_total{host_name=~\"$host\"}[$__rate_interval])), 1)",
           "legendFormat": "error ratio"
         }
       ]
@@ -559,7 +559,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (service_namespace, service_instance_index) (logline_server_active_connections{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"})",
+          "expr": "sum by (service_namespace, service_instance_index) (logline_server_active_connections{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"})",
           "legendFormat": "{{service_namespace}} / {{service_instance_index}}"
         }
       ]
@@ -612,7 +612,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (service_namespace, result) (rate(logline_server_connections_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (service_namespace, result) (rate(logline_server_connections_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{service_namespace}} {{result}}"
         }
       ]
@@ -665,7 +665,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (service_namespace) (rate(logline_server_bytes_received_wire_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{service_namespace}} received"
         },
         {
@@ -674,7 +674,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (service_namespace) (rate(logline_server_bytes_written_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{service_namespace}} written"
         }
       ]
@@ -723,7 +723,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p50"
         },
         {
@@ -732,7 +732,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p95"
         },
         {
@@ -741,7 +741,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(logline_server_write_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "p99"
         }
       ]
@@ -790,7 +790,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, compression) (rate(logline_server_decompress_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, compression) (rate(logline_server_decompress_duration_seconds_bucket{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval])))",
           "legendFormat": "{{compression}}"
         }
       ]
@@ -845,7 +845,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (error_type) (rate(logline_server_protocol_errors_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (error_type) (rate(logline_server_protocol_errors_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{error_type}}"
         }
       ]
@@ -897,7 +897,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(logline_server_auth_failures_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum(rate(logline_server_auth_failures_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "auth failures"
         }
       ]
@@ -946,7 +946,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum by (result) (rate(logline_server_renames_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\",host_name=~\"$host\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(logline_server_renames_total{service_namespace=~\"$namespace\",service_instance_index=~\"$instance\"}[$__rate_interval]))",
           "legendFormat": "{{result}}"
         }
       ]
