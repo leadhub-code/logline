@@ -433,7 +433,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(logline_agent_frames_total{result=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(logline_agent_frames_total{host_name=~\"$host\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(logline_agent_frames_total{result=\"error\",host_name=~\"$host\"}[$__rate_interval])) / clamp_min(sum(rate(logline_agent_frames_total{host_name=~\"$host\"}[$__rate_interval])), 1)",
           "legendFormat": "error ratio"
         }
       ]
