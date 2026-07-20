@@ -30,7 +30,7 @@ def make_server_conf(dest_dir):
     )
 
 
-def make_agent_conf(port, ephemeral_globs=()):
+def make_agent_conf(port):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
@@ -38,7 +38,7 @@ def make_agent_conf(port, ephemeral_globs=()):
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
-        ephemeral_globs=list(ephemeral_globs))
+        ephemeral_globs=[])
 
 
 def dst_dir_for(dst, src):
@@ -215,6 +215,53 @@ def test_ephemeral_orphan_uses_fixed_name_and_overwrites(tmp_path):
 
             # exactly the live file plus a single fixed-name orphan remain
             assert sorted(p.name for p in d.iterdir()) == ['foo.log', 'foo.log.orphan']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_ephemeral_orphan_closing_failure_does_not_resume(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.ephemeral_globs = [str(src.resolve() / '*.log')]
+        # Keep the closing orphan segment alive long enough to break its
+        # connection mid-drain, instead of letting it idle-close first.
+        conf.seal_idle_seconds = 5
+        foo = src / 'foo.log'
+        foo.write_bytes(b'body one\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'body one\n')
+
+            # markerless rotation -> the fixed foo.log.orphan is sealed
+            old = rotate_aside(src, 'foo.log', ISO)
+            foo.write_bytes(b'body two\n')
+            orphan = d / 'foo.log.orphan'
+            await wait_until(lambda: orphan.read_bytes() == b'body one\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'body two\n')
+
+            # grab the closing orphan segment once it is in fail-closed mode
+            await wait_until(lambda: bool(coord.closing))
+            seg = next(iter(coord.closing))
+            await wait_until(lambda: seg._no_resume)
+
+            # Break its connection, then feed the old inode fresh bytes. The
+            # closing drain must fail and END the segment rather than reconnect
+            # and resume: a fixed-name orphan could be a newer file by now, so
+            # resuming stale bytes onto it would corrupt it.
+            seg.conn.close()
+            with old.open('ab') as f:
+                f.write(b'STALE trailing that must never reach the orphan\n')
+
+            await wait_until(lambda: seg.task.done())
+            # the sealed orphan was not appended to after the failure
+            assert orphan.read_bytes() == b'body one\n'
+            # and the live segment is unaffected -- it keeps streaming
+            with foo.open('ab') as f:
+                f.write(b'body two continues\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes()
+                             == b'body two\nbody two continues\n')
         finally:
             await cancel(task)
 

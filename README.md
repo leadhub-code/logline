@@ -52,7 +52,10 @@ by default every orphan gets a unique timestamped name, so they accumulate
 unboundedly per source.
 
 Mark these sources as **ephemeral** in the agent's config file with a list of
-glob patterns (matched against the resolved file path):
+glob patterns. They use the same glob syntax and matching as the `scan` and
+`exclude` keys (`*` stays within a single path component, symlinks resolve the
+same way), so a pattern that selects a file under `scan` selects the same file
+here:
 
 ```yaml
 ephemeral:

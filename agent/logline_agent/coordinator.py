@@ -20,9 +20,10 @@ rename's ack before it starts the new live segment.
 import asyncio
 from asyncio import create_task
 from datetime import datetime, timezone
-from fnmatch import fnmatch
+from glob import glob
 from logging import getLogger
 from os import fstat
+from pathlib import Path
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
@@ -201,6 +202,12 @@ class Segment:
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply
         server_length = reply['length']
+        # Resume detection compares only the first ``prefix_length_bytes`` (~50).
+        # It is weakest for repetitive sources whose segments share an identical
+        # prefix across rotations (e.g. health-check spam in Docker json logs):
+        # two distinct inodes can then look like the same file and be resumed
+        # onto each other. Ephemeral mode makes this recovery path routine, so
+        # the caveat is worth recording; widening the prefix would harden it.
         if (self.role_live and server_length > 0
                 and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
             await self._seal_stale_remote(prefix, server_length)
@@ -340,11 +347,11 @@ class PathCoordinator:
         self.basename = file_path.name
         self.server = server
         self.is_own_log = is_own_log
-        # A source is "ephemeral" when its resolved path matches one of the
-        # configured globs. Ephemeral sources rotate without lh-logrotate markers
-        # (e.g. Docker's json-file driver), so their markerless orphans use a
-        # fixed name that each rotation overwrites instead of accumulating.
-        self.ephemeral = any(fnmatch(str(file_path), pattern) for pattern in conf.ephemeral_globs)
+        # Ephemeral sources rotate without lh-logrotate markers (e.g. Docker's
+        # json-file driver), so their markerless orphans use a fixed name that
+        # each rotation overwrites instead of accumulating.
+        self.ephemeral = self._classify_ephemeral()
+        logger.info('Coordinator for %s (ephemeral=%s)', self.file_path, self.ephemeral)
         self.markers = MarkerWatcher(conf, file_path.parent, file_path.name)
         self.live = None
         self.closing = set()
@@ -428,6 +435,27 @@ class PathCoordinator:
         return Segment(
             self.conf, self.server, self.file_path, f, inode, target,
             self.markers, role_live, is_own_log=self.is_own_log, ephemeral=self.ephemeral)
+
+    def _classify_ephemeral(self):
+        '''
+        Decide whether this source is ephemeral by expanding each configured
+        ``ephemeral`` glob and checking whether the tailed path is among the
+        matches. This deliberately mirrors how ``iter_files`` classifies the
+        ``scan``/``exclude`` keys (``glob(..., recursive=True)`` then compare
+        resolved ``Path``s), so an ``ephemeral`` pattern has the exact same
+        semantics as a same-looking ``scan``/``exclude`` pattern: ``*`` stays
+        within one path component, and symlinks in the path (e.g. a relocated
+        Docker data-root) resolve the same way they did when ``scan`` found the
+        file. A raw ``fnmatch`` on the path string would silently differ on both
+        counts, and over-matching here would convert recoverable timestamped
+        orphans into last-one-wins clobbering.
+        '''
+        resolved = self.file_path.resolve()
+        for pattern in self.conf.ephemeral_globs:
+            for match in glob(pattern, recursive=True):
+                if Path(match).resolve() == resolved:
+                    return True
+        return False
 
     def _reap_closing(self):
         done = {s for s in self.closing if s.task is not None and s.task.done()}
