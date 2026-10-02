@@ -99,16 +99,22 @@ async def async_main(conf):
 
 
 def iter_files(conf):
+    excluded_paths = set()
+    for glob_str in conf.exclude_globs:
+        for p in glob(glob_str, recursive=True):
+            excluded_paths.add(Path(p).resolve())
+
     paths = set()
     for glob_str in conf.scan_globs:
         for p in glob(glob_str, recursive=True):
             if any((Path(p).parent / filename).exists() for filename in conf.exclude_if_file_present):
                 continue
             paths.add(Path(p).resolve())
+
     for glob_str in conf.exclude_globs:
         for p in glob(glob_str, recursive=True):
-            paths.discard(Path(p).resolve())
-    return sorted(paths)
+            excluded_paths.add(Path(p).resolve())
+    return sorted(paths - excluded_paths)
 
 
 async def watch_path(conf, file_path, client_factory):
