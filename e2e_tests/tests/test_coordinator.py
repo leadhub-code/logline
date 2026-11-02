@@ -290,3 +290,78 @@ def test_no_write_before_seal_recovery(tmp_path):
             await cancel(task)
 
     run(tmp_path, scenario)
+
+
+def orphans_in(d):
+    return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+
+
+def test_empty_new_inode_does_not_resume_onto_stale_target(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server still holds the previous inode's content under the live
+        # target (e.g. the agent restarted across a rotation), while the new
+        # inode is still empty when the agent connects.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'OLD content of the previous inode\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            with foo.open('ab') as f:
+                f.write(b'NEW\n')
+            # An empty local prefix must not count as a match: the stale target is
+            # sealed aside instead of being appended to at its old length.
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'OLD content of the previous inode\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_local_file_shorter_than_target_is_a_different_file(tmp_path):
+    async def scenario(src, dst, conf):
+        # Both files start with the same bytes, but the local file is shorter
+        # than the server target, so it cannot be the inode the target mirrors.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'same start\nmore lines the new inode never had\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'same start\n')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'same start\nmore lines the new inode never had\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'same start\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_resume_when_target_is_shorter_than_prefix(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server target holds fewer bytes than the agent's prefix length, and
+        # they are the beginning of the local file: this is a plain resume. Both
+        # sides must hash the same number of bytes, or the match is missed and the
+        # target is needlessly sealed aside as an orphan.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'line one\n')
+
+        content = b'line one\n' + b'line two is long enough to exceed the prefix window\n'
+        foo = src / 'foo.log'
+        foo.write_bytes(content)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == content)
+            assert orphans_in(d) == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)

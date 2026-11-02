@@ -223,6 +223,10 @@ async def serve_client(conf, reader, writer, dst_dir, target, prefix_length):
 
         # Report the current length and prefix hash; never rotate. The agent
         # decides what to do from this (resume, or seal a stale file first).
+        # The hash covers min(length, requested prefix length) bytes; that count
+        # is reported as `prefix_length` so the agent hashes exactly the same
+        # bytes of its own file. `prefix_sha1` keeps its original meaning (null
+        # when nothing was hashed) for older agents.
         if f is not None:
             f.seek(0)
             f_prefix = f.read(prefix_length)
@@ -230,9 +234,10 @@ async def serve_client(conf, reader, writer, dst_dir, target, prefix_length):
             f.seek(0, SEEK_END)
             length = f.tell()
         else:
+            f_prefix = b''
             prefix_sha1 = None
             length = 0
-        await send_reply(writer, 'ok', {'length': length, 'prefix_sha1': prefix_sha1})
+        await send_reply(writer, 'ok', {'length': length, 'prefix_sha1': prefix_sha1, 'prefix_length': len(f_prefix)})
 
         while True:
             command, metadata, data = await recv_command(reader)

@@ -21,19 +21,29 @@ Handshake
 Agent (A) connects to Server (S)
 A: logline-agent-v1 153\n
 A: {"hostname": "server.example.com", "directory": "/var/log", "target": "something.log", "prefix": {"length": 42, "sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}, "auth": {"client_token": "..."}}\n
-S: ok 44\n
-S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}\n
+S: ok 83\n
+S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM=", "prefix_length": 42}\n
 ```
 
 The agent sends the source `directory` and the destination leaf `target`
 separately. The server maps `directory` to `<dest>/<hostname>/<mangled-directory>`
 (each `/` becomes `~`) and writes to `<that directory>/<target>`; it never derives
 a filename from content. It opens the target if it exists and **reports** its
-current `length` and the SHA-1 (base64) of its first `prefix.length` bytes as
-`prefix_sha1` (`null` if the target does not exist). The server never rotates. The
-agent compares `prefix_sha1` with the inode it intends to stream and decides what
-to do (resume, or seal a stale target aside first). A handshake without a valid
-`target` is rejected.
+current `length` and the SHA-1 (base64) of its first `min(length, prefix.length)`
+bytes as `prefix_sha1` (`null` if nothing was hashed, i.e. the target does not
+exist, is empty, or the agent sent `prefix.length` 0). The number of hashed bytes
+is reported as `prefix_length`. The server never rotates. A handshake without a
+valid `target` is rejected.
+
+The agent decides what to do (resume, or seal a stale target aside first). It
+hashes the first `prefix_length` bytes of the inode it intends to stream and
+resumes at `length` only if the hashes match **and** its file is at least
+`length` bytes long. Otherwise (including a non-empty target with nothing
+hashed) the target holds a different file, and the agent seals it aside first.
+
+`prefix_length` was added later. Servers that do not send it hash the same span,
+so an agent derives it as `min(length, prefix.length)`; agents that ignore it are
+unaffected.
 
 Data
 ----

@@ -208,10 +208,29 @@ class Segment:
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
-        if (self.role_live and server_length > 0
-                and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
+        if self.role_live and server_length > 0 and not self._is_same_file(prefix, reply):
             await self._seal_stale_remote(prefix, server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
+
+    def _is_same_file(self, prefix, reply):
+        '''
+        Decide whether a non-empty server target mirrors the inode we stream.
+
+        Both sides must hash the same bytes: the server hashes the first
+        ``min(server_length, len(prefix))`` bytes of the target and reports that
+        count as ``prefix_length`` (older servers hash the same span without
+        reporting it, so we derive it). Nothing hashed (our prefix was empty)
+        is never a match, and neither is a local file shorter than the target:
+        resuming would seek past our EOF and append our later bytes to someone
+        else's content.
+        '''
+        server_length = reply['length']
+        hashed_length = reply.get('prefix_length', min(server_length, len(prefix)))
+        if hashed_length <= 0 or hashed_length > len(prefix):
+            return False
+        if reply.get('prefix_sha1') != sha1_b64(prefix[:hashed_length]):
+            return False
+        return fstat(self.file_stream.fileno()).st_size >= server_length
 
     async def _seal_stale_remote(self, prefix, server_length):
         '''

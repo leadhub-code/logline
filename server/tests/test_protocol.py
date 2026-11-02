@@ -136,7 +136,7 @@ def test_create_and_append(tmp_path):
         data_frame(10, b' world'),
     )
     assert [r[0] for r in replies(writer)] == ['ok', 'ok', 'ok']
-    assert replies(writer)[0][1] == {'length': 0, 'prefix_sha1': None}
+    assert replies(writer)[0][1] == {'length': 0, 'prefix_sha1': None, 'prefix_length': 0}
     assert (dst_dir(tmp_path) / 'app.log').read_bytes() == b'2026 hello world'
 
 
@@ -149,6 +149,18 @@ def test_reports_existing_length_and_prefix(tmp_path):
     assert status == 'ok'
     assert payload['length'] == len(b'2026 existing content')
     assert payload['prefix_sha1'] == sha1_b64(b'2026')
+    assert payload['prefix_length'] == 4
+
+
+def test_reports_hashed_length_when_target_is_shorter_than_prefix(tmp_path):
+    # The hash covers only the bytes the target has, and that count is reported
+    # so the agent can hash the same number of bytes of its own file.
+    d = dst_dir(tmp_path)
+    d.mkdir(parents=True)
+    (d / 'app.log').write_bytes(b'short')
+    writer = drive(make_conf(tmp_path), hello('app.log', b'short and then much longer'))
+    payload = replies(writer)[0][1]
+    assert payload == {'length': 5, 'prefix_sha1': sha1_b64(b'short'), 'prefix_length': 5}
 
 
 def test_never_rotates_on_prefix_mismatch(tmp_path):
