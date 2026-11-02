@@ -68,6 +68,17 @@ so the server keeps at most two files per source — the live file and the last
 sealed segment — instead of an ever-growing pile. Marker-based (lh-logrotate)
 rotations of an ephemeral source are unaffected.
 
+Deleted log files
+-----------------
+
+When a tailed path disappears and nothing recreates it, the agent keeps
+shipping whatever is still written to the deleted file through its open file
+descriptor. Once the path has been missing, and the file fully shipped without
+growth, for `deleted_path_idle_seconds` (agent config key, default 300), the
+agent closes the file and its server connection and stops watching the path. If
+lh-logrotate rotated the file away, the pending marker-based seal is completed
+first. The path is watched again if it reappears.
+
 Scaling the server
 ------------------
 

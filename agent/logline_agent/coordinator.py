@@ -24,6 +24,7 @@ from glob import glob
 from logging import getLogger
 from os import fstat
 from pathlib import Path
+from time import monotonic as monotime
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
@@ -89,8 +90,10 @@ class Segment:
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
+        self._finish_requested = False   # live segment of a deleted path: end once drained
         self.task = None
         self._lag = 0                    # bytes readable but not yet shipped
+        self.last_active = monotime()    # when bytes were last shipped
 
     # -- coordinator-facing API --------------------------------------------
 
@@ -100,6 +103,19 @@ class Segment:
 
     def request_seal(self, seal_name, is_orphan, iso_dt):
         self._pending_seal = (seal_name, is_orphan, iso_dt)
+
+    async def finish(self):
+        '''End a live segment without sealing, once everything readable is shipped.'''
+        self._finish_requested = True
+        if self.task is not None:
+            await self.task
+
+    def is_drained(self):
+        '''True if every byte of the inode has been read (and so shipped).'''
+        try:
+            return fstat(self.file_stream.fileno()).st_size <= self.file_stream.tell()
+        except (OSError, ValueError):
+            return True
 
     async def wait_sealed(self):
         # Resolve when the seal rename is acked, or bail if the segment task died
@@ -116,7 +132,9 @@ class Segment:
         register_lag_source(id(self), lambda: self._lag)
         try:
             await self._connect()
-            await self._live_phase()
+            if await self._live_phase():
+                logger.info('Finished segment %s (target %s)', self.file_path, self.target)
+                return
             await self._do_seal()
             await self._closing_phase()
         except asyncio.CancelledError:
@@ -130,10 +148,13 @@ class Segment:
             self._close()
 
     async def _live_phase(self):
+        '''Stream the live inode until a seal is requested; return True if finished instead.'''
         while self._pending_seal is None:
             sent = await self._drain_available()
             if self._pending_seal is not None:
                 break
+            if self._finish_requested and not sent and self.is_drained():
+                return True
             if self.is_own_log:
                 # do not process our own logfile too often to avoid feedback noise
                 await asyncio.sleep(60)
@@ -176,7 +197,6 @@ class Segment:
 
     async def _drain_until_idle(self):
         '''Orphan completion: drain until no growth for ``seal_idle_seconds``.'''
-        from time import monotonic as monotime
         last_active = monotime()
         while True:
             if await self._drain_available():
@@ -312,6 +332,7 @@ class Segment:
             # re-reads these bytes, so counting post-send avoids double-counting.
             record_bytes_read(len(chunk))
             sent_any = True
+            self.last_active = monotime()
             self._lag = self._stream_lag()
 
     async def _on_truncated(self, pos, size):
@@ -402,6 +423,7 @@ class PathCoordinator:
         self.closing = set()
         self.consumed_isos = set()
         self.last_inode = None
+        self.missing_since = None   # when the path was first seen missing
 
     async def run(self):
         marker_task = create_task(self.markers.run())
@@ -418,9 +440,15 @@ class PathCoordinator:
                     self.live = None
                     self.last_inode = None
                 inode = self._stat_inode()
-                if inode is not None and inode != self.last_inode:
-                    await self._on_new_inode(inode)
-                    self.last_inode = inode
+                if inode is None:
+                    if await self._on_missing_path():
+                        logger.info('%s no longer exists and everything was shipped; stopping', self.file_path)
+                        return
+                else:
+                    self.missing_since = None
+                    if inode != self.last_inode:
+                        await self._on_new_inode(inode)
+                        self.last_inode = inode
                 await asyncio.sleep(self.conf.tail_read_interval_seconds)
         finally:
             marker_task.cancel()
@@ -444,6 +472,38 @@ class PathCoordinator:
             await self._seal_live()
         self.live = self._make_segment(f, f_inode, target=self.basename, role_live=True)
         self.live.start()
+
+    async def _on_missing_path(self):
+        '''
+        The tailed path does not exist. Return True once nothing is left to do
+        for it, so the coordinator ends and the path leaves the watched set.
+
+        The live segment keeps draining the deleted inode (a producer may still
+        write to it) until the path has been missing, and the inode fully shipped
+        without growth, for ``deleted_path_idle_seconds``. Then, if lh-logrotate
+        left a ``.waiting`` marker (it rotated the file away and nothing recreated
+        it), the marker-based seal is completed as on a normal rotation; otherwise
+        the live segment just ends, closing its fd and connection. Closing
+        segments are left to finish on their own.
+        '''
+        now = monotime()
+        if self.missing_since is None:
+            self.missing_since = now
+        if self.live is not None:
+            timeout = self.conf.deleted_path_idle_seconds
+            if (now - self.missing_since < timeout or now - self.live.last_active < timeout
+                    or not self.live.is_drained()):
+                return False
+            if self.markers.newest_unconsumed_waiting(self.consumed_isos) is not None:
+                logger.info('%s was rotated away and not recreated; sealing the live segment', self.file_path)
+                await self._seal_live()
+            else:
+                logger.info('%s is gone and its inode is idle; finishing the live segment', self.file_path)
+                await self.live.finish()
+                self.live = None
+            self.last_inode = None
+            return False
+        return not self.closing
 
     async def _seal_live(self):
         '''Seal the current live segment and move it to the closing set.'''

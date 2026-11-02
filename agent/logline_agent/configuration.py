@@ -121,6 +121,12 @@ class Configuration:
         # lingering fd, never data).
         self.seal_idle_seconds = self.rotated_files_inactivity_threshold_seconds
 
+        # When a tailed path no longer exists, how long it must stay missing and
+        # its (still open) inode must stay fully shipped without growth before
+        # the agent closes the inode and the connection and stops watching the
+        # path. The path is watched again if it reappears.
+        self.deleted_path_idle_seconds = float(cfg.get('deleted_path_idle_seconds', 300))
+
         metrics_cfg = cfg.get('metrics') or {}
         self.metrics_enabled = bool(metrics_cfg.get('enabled'))
         if os.environ.get('OTEL_SDK_DISABLED', '').strip().lower() == 'true':

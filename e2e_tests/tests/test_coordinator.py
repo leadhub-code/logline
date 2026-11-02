@@ -38,6 +38,7 @@ def make_agent_conf(port):
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
+        deleted_path_idle_seconds=5,
         ephemeral_globs=[])
 
 
@@ -391,6 +392,66 @@ def test_truncated_live_file_is_sealed_aside_and_restreamed(tmp_path):
             await wait_until(lambda: (d / 'foo.log').read_bytes()
                              == b'second gen\nand the rest of the second generation after the old offset\n')
             assert orphans_in(d)[0].read_bytes() == b'first generation, long enough to be truncated\n'
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_deleted_path_is_drained_then_released(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.deleted_path_idle_seconds = 0.3
+        foo = src / 'foo.log'
+        foo.write_bytes(b'line one\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'line one\n')
+            seg = coord.live
+            # The producer still holds the inode open after the path is deleted
+            # and writes a last line: it must be shipped before giving up.
+            with foo.open('ab') as producer:
+                foo.unlink()
+                producer.write(b'written after unlink\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'line one\nwritten after unlink\n')
+            # Once drained and idle, the coordinator ends and releases the fd and
+            # the server connection instead of holding them forever.
+            await wait_until(lambda: task.done())
+            assert task.exception() is None
+            assert seg.task.done()
+            assert seg.file_stream.closed
+            assert seg.conn.writer.is_closing()
+            # nothing is renamed for a plain deletion
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotated_away_path_never_recreated_completes_marker_seal(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.deleted_path_idle_seconds = 0.3
+        foo = src / 'foo.log'
+        foo.write_bytes(b'only segment\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'only segment\n')
+            # lh-logrotate rotates the file away, but nothing recreates foo.log
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            # the pending marker-based seal is honoured, not dropped
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists())
+            assert not task.done()
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == b'only segment\n'
+            await wait_until(lambda: task.done())
+            assert task.exception() is None
+            assert coord.live is None and not coord.closing
         finally:
             await cancel(task)
 
