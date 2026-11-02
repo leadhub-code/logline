@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
 from logline_server.main import handle_client, sha1_hex
+from pytest import mark
 
 
 CLIENT_TOKEN = 'topsecret'
@@ -452,6 +453,87 @@ def test_rotated_away_path_never_recreated_completes_marker_seal(tmp_path):
             await wait_until(lambda: task.done())
             assert task.exception() is None
             assert coord.live is None and not coord.closing
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+@mark.parametrize('dropped', ['seal', 'finalize'])
+def test_dropped_rename_is_reapplied(tmp_path, dropped):
+    async def scenario(src, dst, conf):
+        # The first rename frame towards the chosen name is lost: the connection
+        # drops before the server sees it. The agent must reapply the rename after
+        # reconnecting instead of assuming it happened.
+        drop_suffix = ISO if dropped == 'seal' else SHA13
+        drops = []
+
+        async def flaky_factory(**kwargs):
+            conn = await connect_to_server(conf=conf, **kwargs)
+            send_rename = conn.send_rename
+
+            async def maybe_drop(src_name, dst_name):
+                if not drops and dst_name.endswith(drop_suffix):
+                    drops.append(dst_name)
+                    conn.close()
+                    raise ConnectionError('injected: rename frame lost')
+                return await send_rename(src_name, dst_name)
+            conn.send_rename = maybe_drop
+            return conn
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'2026-01-01 12:00:00 line one\n')
+        coord = PathCoordinator(conf, foo.resolve(), flaky_factory)
+        task = asyncio.create_task(coord.run())
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').exists())
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            with old.open('ab') as f:
+                f.write(b'2026-01-01 12:00:01 trailing\n')
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists()
+                             and sealed.read_bytes() == b'2026-01-01 12:00:00 line one\n2026-01-01 12:00:01 trailing\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            await wait_until(lambda: not coord.closing)
+            assert drops, 'the rename drop was not injected'
+            assert final.read_bytes() == b'2026-01-01 12:00:00 line one\n2026-01-01 12:00:01 trailing\n'
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_of_never_shipped_empty_file(tmp_path):
+    async def scenario(src, dst, conf):
+        # The live target was never created on the server (empty source), so the
+        # seal and finalize renames have nothing to rename; the old inode's late
+        # bytes must still end up under the finalized name.
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'new inode\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'new inode\n')
+            with old.open('ab') as f:
+                f.write(b'late line in the old inode\n')
+            await wait_until(lambda: (d / 'foo.log.{}'.format(ISO)).exists())
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == b'late line in the old inode\n'
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
         finally:
             await cancel(task)
 

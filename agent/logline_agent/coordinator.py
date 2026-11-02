@@ -284,7 +284,11 @@ class Segment:
         except Exception:
             pass
         self.conn = None
+        # Reading the prefix moves the read position; keep it, since callers
+        # such as the rename retry continue from where they were.
+        pos = self.file_stream.tell()
         prefix = self._read_prefix()
+        self.file_stream.seek(pos)
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
             try:
@@ -355,30 +359,45 @@ class Segment:
         self.file_stream.seek(self.conn.header_reply['length'])
 
     async def _rename(self, src, dst, fail_closed=False):
+        if not fail_closed and self.file_stream.tell() == 0:
+            # Nothing was ever shipped to `src`, and the server creates targets
+            # lazily on the first append, so there is nothing to rename (the
+            # server would reject a rename where neither name exists). Just bind
+            # the connection to `dst`, where any later bytes belong.
+            self.target = dst
+            await self._reconnect()
+            return
+        backoff = RECONNECT_BACKOFF_MIN_SECONDS
+        retried = False
         while True:
             try:
                 await self.conn.send_rename(src, dst)
-                return
+                break
             except Exception as e:
                 if fail_closed:
-                    # The reconnect-to-destination recovery below assumes `dst` is
-                    # unique to this segment. A fixed `<basename>.orphan` is not:
-                    # `dst` existing may be a *newer* rotation's orphan, not our
-                    # rename applied. Adopting it would resume onto the wrong file,
-                    # so give up and end the segment instead.
+                    # The retry below relies on `dst` being unique to this
+                    # segment. A fixed `<basename>.orphan` is not: `dst` existing
+                    # may be a *newer* rotation's orphan, not our rename applied.
+                    # Adopting it would resume onto the wrong file, so give up and
+                    # end the segment instead.
                     logger.warning('seal rename %s -> %s on %s failed: %r; ending segment '
                                    '(fixed orphan name is unsafe to resume onto)',
                                    src, dst, self.file_path, e)
                     raise _EndSegment() from e
-                logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
-                               src, dst, self.file_path, e)
-                # Reconnect targeting the destination: the rename may already be
-                # applied server-side (it is idempotent), or still pending.
-                self.target = dst
+                logger.warning('rename %s -> %s on %s failed: %r; reconnecting and retrying in %.1fs',
+                               src, dst, self.file_path, e, backoff)
+                # We cannot tell whether the server applied the rename before the
+                # failure, so resend it on a fresh connection: the frame is
+                # idempotent (`from` absent and `to` present is a no-op `ok`).
+                retried = True
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
                 await self._reconnect()
-                if self.conn.header_reply['length'] >= 0:
-                    # server now holds `dst`; the rename is effectively done
-                    return
+        self.target = dst
+        if retried:
+            # The retry connection was opened on `src`. If the rename had already
+            # been applied, that connection holds no file, so rebind it to `dst`.
+            await self._reconnect()
 
     def _read_prefix(self):
         self.file_stream.seek(0)
