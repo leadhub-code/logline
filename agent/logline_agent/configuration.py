@@ -104,6 +104,11 @@ class Configuration:
         self.prefix_length_bytes = 50
         self.min_prefix_length_bytes = 20
 
+        # How long to wait for the server to accept a frame and reply to it. A
+        # reply normally takes milliseconds; together with TCP keepalive this
+        # bounds how long a segment can hang on a dead connection.
+        self.reply_timeout_seconds = float(cfg.get('reply_timeout_seconds', 60))
+
         self.tail_read_interval_seconds = 1
         self.scan_new_files_interval_seconds = 1
         self.rotated_files_inactivity_threshold_seconds = 600

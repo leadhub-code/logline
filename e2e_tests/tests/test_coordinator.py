@@ -9,14 +9,16 @@ original name (a new inode), and the marker siblings appear in the directory.
 
 import asyncio
 from functools import partial
+import socket
 from socket import getfqdn
+import sys
 from time import monotonic
 from types import SimpleNamespace
 
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
 from logline_server.main import handle_client, sha1_hex
-from pytest import mark
+from pytest import mark, raises
 
 
 CLIENT_TOKEN = 'topsecret'
@@ -39,7 +41,7 @@ def make_agent_conf(port):
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
-        deleted_path_idle_seconds=5,
+        deleted_path_idle_seconds=5, reply_timeout_seconds=60,
         ephemeral_globs=[])
 
 
@@ -538,3 +540,43 @@ def test_rotation_of_never_shipped_empty_file(tmp_path):
             await cancel(task)
 
     run(tmp_path, scenario)
+
+
+@mark.skipif(not sys.platform.startswith('linux'), reason='keepalive tuning options are Linux-specific')
+def test_agent_connection_has_keepalive(tmp_path):
+    async def scenario(src, dst, conf):
+        (src / 'foo.log').write_bytes(b'x')
+        conn = await connect_to_server(conf=conf, log_path=src / 'foo.log', target='foo.log', log_prefix=b'x')
+        try:
+            sock = conn.writer.get_extra_info('socket')
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 30
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 10
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 3
+        finally:
+            conn.close()
+
+    run(tmp_path, scenario)
+
+
+def test_unresponsive_server_times_out_per_reply_timeout(tmp_path):
+    async def scenario():
+        # A server that accepts the connection but never replies, like the far
+        # end of a half-open connection.
+        async def silent(reader, writer):
+            await reader.read()
+
+        server = await asyncio.start_server(silent, '127.0.0.1', 0)
+        conf = make_agent_conf(server.sockets[0].getsockname()[1])
+        conf.reply_timeout_seconds = 0.3
+        try:
+            t0 = monotonic()
+            with raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    connect_to_server(conf=conf, log_path=tmp_path / 'foo.log', target='foo.log', log_prefix=b''), 5)
+            assert monotonic() - t0 < 2
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())

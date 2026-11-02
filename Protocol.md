@@ -8,6 +8,13 @@ The connection can be wrapped into TLS – in that case both Agent and Server mu
 
 Purpose of the connection is to transfer a log file content from Agent to Server.
 
+Connections are long-lived and may stay idle for hours while a log file is
+quiet, so neither side drops an authenticated connection for being idle. Both
+sides enable TCP keepalive (on Linux: first probe after 30 s idle, then every
+10 s, give up after 3 probes) so a half-open connection, whose peer host
+vanished, is detected within about a minute. The agent also waits at most
+`reply_timeout_seconds` (default 60) for the reply to each frame.
+
 The agent is the sole authority on file identity and rotation. Each connection is
 bound to one explicit **`target`** filename chosen by the agent; the server only
 appends bytes to that target and renames it when told to. It never decides file

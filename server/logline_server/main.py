@@ -11,6 +11,7 @@ from logging.handlers import WatchedFileHandler
 import lzma
 import os
 from reprlib import repr as smart_repr
+import socket
 from ssl import Purpose, create_default_context
 from time import monotonic as monotime
 
@@ -39,7 +40,21 @@ logger = getLogger(__name__)
 # ever authenticating (e.g. slowloris-style). Established, authenticated
 # connections are intentionally allowed to stay idle for as long as needed,
 # since the agent only sends data when the watched log grows.
+#
+# There is deliberately no idle timeout for authenticated connections: a live
+# file can be quiet for hours, and the agent only notices a dropped connection
+# when it next sends a frame. Agents up to 7adea8a then treat a failed seal or
+# finalize rename as applied, so routinely dropping idle connections would turn
+# every rotation of a quiet log into a misnamed segment and an extra orphan.
+# Dead peers (half-open connections) are detected by TCP keepalive instead.
 handshake_timeout = 30
+
+# TCP keepalive tuning (Linux): probe an idle connection after 30 s, then every
+# 10 s, and drop it after 3 unanswered probes, so a connection whose agent host
+# vanished without a FIN/RST is closed within about a minute.
+KEEPALIVE_IDLE_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_COUNT = 3
 
 
 def server_main():
@@ -130,6 +145,7 @@ async def handle_client(conf, reader, writer):
     try:
         addr = writer.get_extra_info('peername')
         logger.debug('New client has connected: %s', addr)
+        enable_keepalive(writer.get_extra_info('socket'))
         try:
             command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
         except ReceivedHTTPRequestError:
@@ -357,6 +373,21 @@ def fsync_dir(path):
         logger.warning('fsync of directory %s failed: %r', path, e)
     finally:
         os.close(fd)
+
+
+def enable_keepalive(sock):
+    '''Enable TCP keepalive on ``sock`` with the aggressive Linux tuning above, where available.'''
+    if not hasattr(sock, 'setsockopt'):
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (('TCP_KEEPIDLE', KEEPALIVE_IDLE_SECONDS),
+                            ('TCP_KEEPINTVL', KEEPALIVE_INTERVAL_SECONDS),
+                            ('TCP_KEEPCNT', KEEPALIVE_COUNT)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError as e:
+        logger.warning('Could not enable TCP keepalive: %r', e)
 
 
 async def send_http_response(writer):
