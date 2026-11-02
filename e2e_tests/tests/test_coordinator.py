@@ -365,3 +365,33 @@ def test_resume_when_target_is_shorter_than_prefix(tmp_path):
             await cancel(task)
 
     run(tmp_path, scenario)
+
+
+def test_truncated_live_file_is_sealed_aside_and_restreamed(tmp_path):
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'first generation, long enough to be truncated\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'first generation, long enough to be truncated\n')
+            # copytruncate: the same inode shrinks below the shipped offset
+            with foo.open('r+b') as f:
+                f.truncate(0)
+            with foo.open('ab') as f:
+                f.write(b'second gen\n')
+            # The old mirror is sealed aside as an orphan and the inode is
+            # streamed again from offset 0 into a fresh live target.
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'first generation, long enough to be truncated\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'second gen\n')
+            # bytes written past the old offset later must not land in the orphan
+            with foo.open('ab') as f:
+                f.write(b'and the rest of the second generation after the old offset\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes()
+                             == b'second gen\nand the rest of the second generation after the old offset\n')
+            assert orphans_in(d)[0].read_bytes() == b'first generation, long enough to be truncated\n'
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)

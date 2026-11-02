@@ -56,6 +56,9 @@ class _EndSegment(Exception):
     no longer unique, and reconnecting would risk resuming onto a *newer* orphan
     (offset taken from the wrong file, stale bytes interleaved). The data of a
     sealed orphan is end-of-life, so we fail closed instead: log and end.
+
+    Also raised when a closing segment's inode is truncated: its sealed target
+    must not receive the truncated inode's new content.
     '''
 
 
@@ -284,6 +287,10 @@ class Segment:
         sent_any = False
         while True:
             pos = self.file_stream.tell()
+            size = fstat(self.file_stream.fileno()).st_size
+            if size < pos:
+                await self._on_truncated(pos, size)
+                continue
             chunk = self.file_stream.read(CHUNK_SIZE)
             if not chunk:
                 self._lag = 0
@@ -306,6 +313,25 @@ class Segment:
             record_bytes_read(len(chunk))
             sent_any = True
             self._lag = self._stream_lag()
+
+    async def _on_truncated(self, pos, size):
+        '''
+        The inode shrank below our read offset (copytruncate or a plain
+        truncation). Treat it as a markerless rotation of the same inode: the
+        target holds the previous generation, so seal it aside and stream the
+        inode again from offset 0 into a fresh target. Without this the segment
+        would stall at EOF and later append post-offset bytes to the old mirror.
+        '''
+        logger.warning('%s was truncated (size %d < shipped offset %d); target %s',
+                       self.file_path, size, pos, self.target)
+        record_rotation()
+        if not self.role_live:
+            # A closing segment's target is a sealed name; the truncated inode's
+            # new content does not belong there, so stop shipping it.
+            logger.warning('Ending closing segment %s (target %s) after truncation', self.file_path, self.target)
+            raise _EndSegment()
+        await self._seal_stale_remote(self._read_prefix(), pos)
+        self.file_stream.seek(self.conn.header_reply['length'])
 
     async def _rename(self, src, dst, fail_closed=False):
         while True:
