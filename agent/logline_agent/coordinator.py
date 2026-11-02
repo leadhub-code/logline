@@ -24,6 +24,7 @@ from glob import glob
 from logging import getLogger
 from os import fstat
 from pathlib import Path
+from random import uniform
 from time import monotonic as monotime
 
 from .client import sha1_b64
@@ -41,6 +42,11 @@ CHUNK_SIZE = 2 ** 20
 # rather than killing the segment.
 RECONNECT_BACKOFF_MIN_SECONDS = 1.0
 RECONNECT_BACKOFF_MAX_SECONDS = 30.0
+
+
+def jittered(seconds):
+    '''Randomize a backoff delay so agents do not reconnect in lockstep after a server outage.'''
+    return seconds * uniform(0.5, 1.5)
 
 
 def utc_iso_dt():
@@ -220,9 +226,7 @@ class Segment:
     # -- connection / IO ---------------------------------------------------
 
     async def _connect(self):
-        prefix = self._read_prefix()
-        self.conn = await self.server(
-            log_path=self.file_path, target=self.target, log_prefix=prefix)
+        prefix = await self._open_connection()
         reply = self.conn.header_reply
         server_length = reply['length']
         # Resume detection compares only the first ``prefix_length_bytes`` (~50).
@@ -232,7 +236,7 @@ class Segment:
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
         if self.role_live and server_length > 0 and not self._is_same_file(prefix, reply):
-            await self._seal_stale_remote(prefix, server_length)
+            await self._seal_stale_remote(server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 
     def _is_same_file(self, prefix, reply):
@@ -255,7 +259,7 @@ class Segment:
             return False
         return fstat(self.file_stream.fileno()).st_size >= server_length
 
-    async def _seal_stale_remote(self, prefix, server_length):
+    async def _seal_stale_remote(self, server_length):
         '''
         Recovery: the live target already holds a different, completed segment
         (e.g. a rotation we missed across a crash). We must not append to it.
@@ -274,8 +278,7 @@ class Segment:
         # file; we drop it and reconnect fresh to the original target.
         await self.conn.send_rename(self.target, seal_name)
         self.conn.close()
-        self.conn = await self.server(
-            log_path=self.file_path, target=self.target, log_prefix=prefix)
+        await self._open_connection()
 
     async def _reconnect(self):
         try:
@@ -284,26 +287,35 @@ class Segment:
         except Exception:
             pass
         self.conn = None
-        # Reading the prefix moves the read position; keep it, since callers
-        # such as the rename retry continue from where they were.
-        pos = self.file_stream.tell()
-        prefix = self._read_prefix()
-        self.file_stream.seek(pos)
+        await self._open_connection()
+
+    async def _open_connection(self):
+        '''
+        Connect ``self.conn`` to ``self.target`` and return the prefix sent.
+
+        Failures (refused connection, failed handshake) are retried with a capped,
+        jittered exponential backoff instead of propagating and ending the
+        segment task: a paused file resumes once the server is back, and an
+        unreachable server is not hammered by a respawn on every coordinator tick.
+        '''
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
+            # Reading the prefix moves the read position; keep it, since callers
+            # such as the rename retry continue from where they were.
+            pos = self.file_stream.tell()
+            prefix = self._read_prefix()
+            self.file_stream.seek(pos)
             try:
                 self.conn = await self.server(
                     log_path=self.file_path, target=self.target, log_prefix=prefix)
-                return
+                return prefix
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Keep retrying instead of letting the failure propagate and
-                # end the segment task: a paused file resumes once the server
-                # is back, an orphaned one stays frozen until the next rotation.
-                logger.warning('Reconnect for %s (target %s) failed: %r; retrying in %.1fs',
-                               self.file_path, self.target, e, backoff)
-                await asyncio.sleep(backoff)
+                delay = jittered(backoff)
+                logger.warning('Connecting %s (target %s) failed: %r; retrying in %.1fs',
+                               self.file_path, self.target, e, delay)
+                await asyncio.sleep(delay)
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
 
     async def _drain_available(self):
@@ -355,7 +367,7 @@ class Segment:
             # new content does not belong there, so stop shipping it.
             logger.warning('Ending closing segment %s (target %s) after truncation', self.file_path, self.target)
             raise _EndSegment()
-        await self._seal_stale_remote(self._read_prefix(), pos)
+        await self._seal_stale_remote(pos)
         self.file_stream.seek(self.conn.header_reply['length'])
 
     async def _rename(self, src, dst, fail_closed=False):
@@ -384,13 +396,14 @@ class Segment:
                                    '(fixed orphan name is unsafe to resume onto)',
                                    src, dst, self.file_path, e)
                     raise _EndSegment() from e
+                delay = jittered(backoff)
                 logger.warning('rename %s -> %s on %s failed: %r; reconnecting and retrying in %.1fs',
-                               src, dst, self.file_path, e, backoff)
+                               src, dst, self.file_path, e, delay)
                 # We cannot tell whether the server applied the rename before the
                 # failure, so resend it on a fresh connection: the frame is
                 # idempotent (`from` absent and `to` present is a no-op `ok`).
                 retried = True
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(delay)
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
                 await self._reconnect()
         self.target = dst

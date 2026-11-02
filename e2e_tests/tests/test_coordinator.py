@@ -580,3 +580,46 @@ def test_unresponsive_server_times_out_per_reply_timeout(tmp_path):
             await server.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_initial_connect_failure_backs_off_and_recovers(tmp_path):
+    async def scenario():
+        src = tmp_path / 'src'
+        src.mkdir()
+        dst = tmp_path / 'dst'
+        dst.mkdir()
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            port = s.getsockname()[1]
+        conf = make_agent_conf(port)
+        attempts = []
+
+        async def counting_factory(**kwargs):
+            attempts.append(monotonic())
+            return await connect_to_server(conf=conf, **kwargs)
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'shipped once the server is up\n')
+        coord = PathCoordinator(conf, foo.resolve(), counting_factory)
+        task = asyncio.create_task(coord.run())
+        server = None
+        try:
+            # The server is down: the first connect must be retried with backoff
+            # by the same segment, not fail the segment and get respawned on
+            # every coordinator tick.
+            await asyncio.sleep(0.4)
+            assert 1 <= len(attempts) <= 2
+            seg = coord.live
+            assert seg is not None and not seg.task.done()
+
+            server = await asyncio.start_server(partial(handle_client, make_server_conf(dst)), '127.0.0.1', port)
+            d = dst_dir_for(dst, src)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'shipped once the server is up\n')
+            assert coord.live is seg
+        finally:
+            await cancel(task)
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+
+    asyncio.run(scenario())
