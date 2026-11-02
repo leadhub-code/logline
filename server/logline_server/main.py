@@ -196,11 +196,9 @@ async def handle_client(conf, reader, writer):
         dst_dir = build_destination_dir(conf.destination_directory, header['hostname'], directory)
 
         if not dst_dir.is_dir():
-            if not dst_dir.parent.is_dir():
-                logger.debug('Creating directory: %s', dst_dir.parent)
-                dst_dir.parent.mkdir()
             logger.debug('Creating directory: %s', dst_dir)
-            dst_dir.mkdir()
+            # Another server process (--reuse-port) may create it concurrently.
+            dst_dir.mkdir(parents=True, exist_ok=True)
 
         target = header.get('target')
         if not isinstance(target, str) or not _is_safe_path_segment(target):
