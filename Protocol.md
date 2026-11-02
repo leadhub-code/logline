@@ -66,6 +66,24 @@ The server **must** verify that `offset` equals the current length of the target
 and replies with an explicit protocol error (closing the connection) on mismatch.
 `compression` may be `null`, `"gzip"`, `"lzma"` or `"zst"`.
 
+Errors
+------
+
+When the server rejects a handshake or a frame (offset mismatch, malformed frame,
+failed authentication, failed rename, …) it replies with an `error` status and a
+JSON payload, then closes the connection:
+
+```
+S: error 64\n
+S: {"error": "Unexpected data offset: client sent 999, expected 5"}\n
+```
+
+The `error` text is informational: protocol errors carry their message, other
+failures a generic one. The reply is best effort; the agent must treat an `error`
+reply and a connection closed without a reply the same way, as a failed
+connection that it reconnects and resumes from (servers before this reply was
+added only closed the connection).
+
 Rename
 ------
 

@@ -49,6 +49,9 @@ logger = getLogger(__name__)
 # Dead peers (half-open connections) are detected by TCP keepalive instead.
 handshake_timeout = 30
 
+# How long to wait for an error reply to be flushed before closing anyway.
+error_reply_timeout = 5
+
 # TCP keepalive tuning (Linux): probe an idle connection after 30 s, then every
 # 10 s, and drop it after 3 unanswered probes, so a connection whose agent host
 # vanished without a FIN/RST is closed within about a minute.
@@ -213,6 +216,7 @@ async def handle_client(conf, reader, writer):
     except Exception as e:
         logger.exception('Failed to handle client: %r', e)
         result = 'error'
+        await send_error_reply(writer, e)
     finally:
         record_connection(result)
         active_connection_dec()
@@ -525,6 +529,20 @@ async def send_reply(writer, status, payload):
         writer.write(payload_bytes)
         logger.debug('Sent reply %s %r', status, payload)
     await writer.drain()
+
+
+async def send_error_reply(writer, exc):
+    '''
+    Best effort: tell the agent why its connection is being closed. Agents treat
+    an ``error`` reply like a dropped connection (they reconnect), so this only
+    makes the failure explicit. Protocol errors carry their message; other
+    failures (e.g. authentication) get a generic one.
+    '''
+    message = str(exc) if isinstance(exc, ProtocolError) else 'request failed'
+    try:
+        await wait_for(send_reply(writer, 'error', {'error': message}), timeout=error_reply_timeout)
+    except Exception as e:
+        logger.debug('Could not send error reply: %r', e)
 
 
 def sha1_b64(data):

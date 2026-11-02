@@ -211,11 +211,20 @@ def test_offset_mismatch_is_rejected(tmp_path):
         conf,
         hello('app.log', b'2026'),
         data_frame(0, b'hello'),
-        data_frame(999, b'!'),  # wrong offset -> ProtocolError, connection closed
+        data_frame(999, b'!'),  # wrong offset -> explicit error reply, connection closed
     )
-    # header reply + first data reply only; the bad frame gets no 'ok'
-    assert [r[0] for r in replies(writer)] == ['ok', 'ok']
+    # header reply + first data reply, then an explicit error for the bad frame
+    assert [r[0] for r in replies(writer)] == ['ok', 'ok', 'error']
+    assert 'offset' in replies(writer)[2][1]['error']
+    assert writer.closed
     assert (dst_dir(tmp_path) / 'app.log').read_bytes() == b'hello'
+
+
+def test_failed_handshake_gets_error_reply(tmp_path):
+    conf = make_conf(tmp_path)
+    writer = drive(conf, hello('app.log', b'2026', auth={'client_token': 'wrong'}))
+    assert [r[0] for r in replies(writer)] == ['error']
+    assert writer.closed
 
 
 # --- handle_rename unit tests ---------------------------------------------

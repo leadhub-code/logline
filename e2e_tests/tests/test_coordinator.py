@@ -15,7 +15,7 @@ import sys
 from time import monotonic
 from types import SimpleNamespace
 
-from logline_agent.client import connect_to_server
+from logline_agent.client import ClientError, connect_to_server
 from logline_agent.coordinator import PathCoordinator
 from logline_server.main import handle_client, sha1_hex
 from pytest import mark, raises
@@ -623,3 +623,15 @@ def test_initial_connect_failure_backs_off_and_recovers(tmp_path):
                 await server.wait_closed()
 
     asyncio.run(scenario())
+
+
+def test_agent_receives_explicit_error_reply(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server answers a rejected handshake with an explicit `error` reply,
+        # which the agent surfaces as a ClientError (and treats as a failed
+        # connection), instead of a bare connection close.
+        conf.client_token = 'not the right token'
+        with raises(ClientError, match='Error reply'):
+            await connect_to_server(conf=conf, log_path=src / 'foo.log', target='foo.log', log_prefix=b'')
+
+    run(tmp_path, scenario)
