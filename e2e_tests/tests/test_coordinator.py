@@ -268,30 +268,6 @@ def test_ephemeral_orphan_closing_failure_does_not_resume(tmp_path):
     run(tmp_path, scenario)
 
 
-def test_no_write_before_seal_recovery(tmp_path):
-    async def scenario(src, dst, conf):
-        # server already holds a different (older) file under the live target
-        d = dst_dir_for(dst, src)
-        d.mkdir(parents=True)
-        (d / 'foo.log').write_bytes(b'OLD stale content from a missed segment\n')
-
-        foo = src / 'foo.log'
-        foo.write_bytes(b'NEW current inode content\n')
-        coord, task = start_coordinator(conf, foo)
-        try:
-            # the stale remote file is sealed aside (orphan), not appended to
-            def orphan_sealed():
-                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
-            await wait_until(lambda: bool(orphan_sealed()))
-            assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
-            # and the new content is streamed cleanly into the live target
-            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
-        finally:
-            await cancel(task)
-
-    run(tmp_path, scenario)
-
-
 def test_empty_new_file_does_not_resume_onto_stale_remote(tmp_path):
     async def scenario(src, dst, conf):
         # The agent missed a rotation (e.g. it was down): the server still holds
@@ -316,6 +292,30 @@ def test_empty_new_file_does_not_resume_onto_stale_remote(tmp_path):
             foo.write_bytes(b'NEW line one\nNEW line two, long enough to pass the old length\n')
             await wait_until(lambda: (d / 'foo.log').read_bytes()
                              == b'NEW line one\nNEW line two, long enough to pass the old length\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_no_write_before_seal_recovery(tmp_path):
+    async def scenario(src, dst, conf):
+        # server already holds a different (older) file under the live target
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'OLD stale content from a missed segment\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'NEW current inode content\n')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            # the stale remote file is sealed aside (orphan), not appended to
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
+            # and the new content is streamed cleanly into the live target
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
         finally:
             await cancel(task)
 
