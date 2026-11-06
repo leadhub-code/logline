@@ -29,11 +29,6 @@ flowchart LR
     w1agent -- "TCP :5645<br/>TLS + client token" --> server["logline-server"]
     d1agent -- "TCP :5645<br/>TLS + client token" --> server
     server --> mirror[("mirror directory<br/>&lt;dest&gt;/&lt;hostname&gt;/…")]
-
-    w1agent -. "OTLP metrics" .-> otel["OpenTelemetry<br/>collector"]
-    d1agent -. "OTLP metrics" .-> otel
-    server -. "OTLP metrics" .-> otel
-    otel -.-> grafana["Prometheus + Grafana"]
 ```
 
 Features
