@@ -2,7 +2,7 @@
 name = "logline-e2e-tests"
 version = "0.0.1"
 description = "Logline end-to-end tests"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "logline-agent",
     "logline-server",
