@@ -13,8 +13,11 @@ from socket import getfqdn
 from time import monotonic
 from types import SimpleNamespace
 
+import pytest
+
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
+import logline_server.main as server_main
 from logline_server.main import handle_client, sha1_hex
 
 
@@ -286,6 +289,72 @@ def test_no_write_before_seal_recovery(tmp_path):
             assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
             # and the new content is streamed cleanly into the live target
             await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+@pytest.mark.parametrize('failing_rename', ['seal', 'finalize'])
+def test_rename_dropped_by_server_is_retried(tmp_path, monkeypatch, failing_rename):
+    # The server drops the connection after receiving a rename frame but before
+    # applying it (e.g. it is restarting). The agent must notice that the rename
+    # did not happen and retry it, instead of assuming it was applied.
+    fail_to = 'foo.log.{}'.format(ISO) if failing_rename == 'seal' else 'foo.log.{}.{}'.format(ISO, SHA13)
+    original_handle_rename = server_main.handle_rename
+    dropped = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not dropped:
+            dropped.append(metadata)
+            raise ConnectionResetError('simulated connection drop before the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'2026-01-01 12:00:00 line one\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:00:00 line one\n')
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert dropped, 'the simulated failure was not triggered'
+            assert final.read_bytes() == b'2026-01-01 12:00:00 line one\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+            # no leftover sealed segment and no duplicate copy sealed aside as an orphan
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_of_empty_file_with_markers(tmp_path):
+    # Nothing was ever sent for the old (empty) inode, so the server holds
+    # neither the source nor the destination name of the seal and finalize
+    # renames. The agent must carry on rather than get stuck retrying them.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await asyncio.sleep(0.1)
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+            await asyncio.sleep(0.3)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
         finally:
             await cancel(task)
 

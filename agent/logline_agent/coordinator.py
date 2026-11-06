@@ -306,12 +306,24 @@ class Segment:
                     raise _EndSegment() from e
                 logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
                                src, dst, self.file_path, e)
-                # Reconnect targeting the destination: the rename may already be
-                # applied server-side (it is idempotent), or still pending.
+                # The failure does not tell whether the server applied the rename.
+                # Ask it: reconnect targeting the destination; if that holds our
+                # data, the rename is done.
                 self.target = dst
                 await self._reconnect()
-                if self.conn.header_reply['length'] >= 0:
-                    # server now holds `dst`; the rename is effectively done
+                if self.conn.header_reply['length'] > 0:
+                    return
+                # Not applied. Reconnect targeting the source and retry the rename
+                # on that connection (the server's rename is idempotent).
+                self.target = src
+                await self._reconnect()
+                if self.conn.header_reply['length'] == 0:
+                    # Neither name holds any data: nothing was ever sent, so there
+                    # is nothing to rename. Continue under the destination name.
+                    logger.info('rename %s -> %s on %s: nothing to rename on the server',
+                                src, dst, self.file_path)
+                    self.target = dst
+                    await self._reconnect()
                     return
 
     def _read_prefix(self):
