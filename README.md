@@ -16,7 +16,7 @@ Logline has two components:
 - **agent** runs on every machine whose logs you want to collect. It follows the
   log files and sends new content to the server over a TCP connection,
   optionally encrypted with TLS.
-- **server** runs on the central machine. It receives the data from all agents
+- **server** runs on a central machine. It receives the data from all agents
   and keeps a mirror of their log files in a directory.
 
 ```mermaid
@@ -94,7 +94,7 @@ mkdir -p /srv/logline
 logline-server --dest /srv/logline --client-token-hash <sha1-hex-from-above>
 ```
 
-Run the agent on every machine whose logs you want to collect:
+Run the agent on each machine:
 
 ```bash
 logline-agent --server logs.example.com:5645 --token-file client-token --scan '/var/log/*.log'
@@ -262,7 +262,7 @@ sequenceDiagram
     participant A as logline-agent
     participant S as logline-server
 
-    Note over A,S: steady state – the live segment streams foo.log into foo.log
+    Note over A,S: steady state – the agent streams foo.log into the live file foo.log
     Note over R: move foo.log aside,<br/>start a new foo.log
     Note over A: notice a new inode at foo.log
     A->>S: old connection: rename foo.log → foo.log.#lt;iso_dt#gt;.orphan
@@ -310,7 +310,7 @@ would be shipped a second time as a separate file.
 Ephemeral log sources
 ---------------------
 
-Some sources rotate on their own, without any rotation markers — most
+Some sources rotate on their own, without any rotation markers – most
 notably Docker's `json-file` logging driver
 (`/var/lib/docker/containers/<id>/<id>-json.log`), which self-rotates every few
 minutes. Each such markerless rotation is sealed server-side as an *orphan*, and
@@ -330,8 +330,8 @@ ephemeral:
 
 A markerless rotation of an ephemeral source is sealed under the fixed name
 `<basename>.orphan` (no timestamp). Each rotation overwrites the previous orphan,
-so the server keeps at most two files per source — the live file and the last
-sealed segment — instead of an ever-growing pile. Marker-based rotations of an
+so the server keeps at most two files per source – the live file and the last
+sealed segment – instead of an ever-growing pile. Marker-based rotations of an
 ephemeral source are unaffected.
 
 Scaling the server
