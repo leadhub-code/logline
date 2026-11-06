@@ -22,6 +22,16 @@ def make_args(**overrides):
     return Namespace(**args)
 
 
+@pytest.mark.parametrize('content', ['', '# everything is commented out\n'], ids=['empty', 'comments-only'])
+def test_empty_config_file(tmp_path, content):
+    # YAML loads an empty or comments-only document as None; the CLI options
+    # from make_args() still have to be enough to configure the server.
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(content)
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.client_token_hashes == {'dummyhash'}
+
+
 def test_reuse_port_defaults_to_false():
     conf = Configuration(args=make_args())
     assert conf.reuse_port is False
@@ -81,3 +91,28 @@ def test_log_file_level_rejects_unknown_level(tmp_path):
     cfg_path = write_conf_with_log_level(tmp_path, 'trace')
     with pytest.raises(ConfigurationError):
         Configuration(args=make_args(conf=str(cfg_path)))
+
+
+def test_tls_key_password_defaults_to_none(tmp_path, monkeypatch):
+    # A TLS key without a password (e.g. from Let's Encrypt) is the common case;
+    # create_server() reads conf.tls_password unconditionally.
+    monkeypatch.delenv('TLS_KEY_PASSWORD', raising=False)
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(
+        'dest: dst\n'
+        'client_token_hashes: [dummyhash]\n'
+        'tls:\n  cert: cert.pem\n  key: key.pem\n')
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.use_tls is True
+    assert conf.tls_password is None
+
+
+def test_tls_section_with_all_keys_commented_out(tmp_path):
+    # YAML loads a section whose keys are all commented out as None.
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(
+        'dest: dst\n'
+        'client_token_hashes: [dummyhash]\n'
+        'tls:\n  # cert: cert.pem\n')
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.use_tls is False
