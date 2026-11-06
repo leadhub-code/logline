@@ -17,4 +17,22 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Build the Docker image for Logline Server
-      run: docker build server --tag logline-server:$(date +%s)
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        GIT_COMMIT=$(git rev-parse HEAD)
+        if [ "$EVENT_NAME" = pull_request ]; then
+          # On pull_request events the checkout is a temporary merge commit of the PR head
+          # into the base branch, which exists nowhere else, so record its parents as well.
+          # They are read from the commit object, because HEAD^1/HEAD^2 do not resolve in
+          # the shallow clone made by actions/checkout.
+          set -- $(git cat-file -p HEAD | sed -n 's/^parent //p')
+          if [ $# -eq 2 ]; then
+            GIT_COMMIT="$GIT_COMMIT, merge of $2 into $1"
+          fi
+        fi
+        docker build server --tag logline-server:ci --build-arg GIT_COMMIT="$GIT_COMMIT"
+    - name: Smoke test the image
+      run: |
+        docker run --rm logline-server:ci --help >/dev/null
+        docker run --rm logline-server:ci --version

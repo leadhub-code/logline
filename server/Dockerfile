@@ -14,6 +14,25 @@ RUN uv sync --frozen --no-dev --no-install-project --extra otel
 # validates while building the project.
 COPY README.md LICENSE ./
 COPY logline_server ./logline_server
+
+# Record the git commit the image is built from, shown by `--version`. The
+# build context does not include .git, so it has to be passed in, e.g.
+# `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`. Accepted forms are a commit
+# hash, optionally followed by "-dirty", or "<merge>, merge of <head> into
+# <base>" for a pull request merge commit. Nothing else is accepted, so the
+# value is safe to put into the code.
+ARG GIT_COMMIT=
+# The newline check is needed because grep matches line by line; set -e makes
+# a failing sed fail the build.
+RUN set -e; \
+    if [ -n "$GIT_COMMIT" ]; then \
+        [ "$(printf '%s' "$GIT_COMMIT" | wc -l)" -eq 0 ] || { echo "Invalid GIT_COMMIT: contains a newline" >&2; exit 1; }; \
+        printf '%s\n' "$GIT_COMMIT" | grep -Eqx '[0-9a-f]{7,64}(-dirty|, merge of [0-9a-f]{7,64} into [0-9a-f]{7,64})?' \
+            || { echo "Invalid GIT_COMMIT: $GIT_COMMIT" >&2; exit 1; }; \
+        sed -i "s/^git_commit = None\$/git_commit = '$GIT_COMMIT'/" logline_server/version.py; \
+        grep -qx "git_commit = '$GIT_COMMIT'" logline_server/version.py; \
+    fi
+
 RUN uv sync --frozen --no-dev --extra otel
 
 ENV PATH="/src/.venv/bin:$PATH"
