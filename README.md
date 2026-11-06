@@ -1,16 +1,215 @@
 Logline
 =======
 
+[![Python tests](https://github.com/leadhub-code/logline/actions/workflows/python-tests.yml/badge.svg)](https://github.com/leadhub-code/logline/actions/workflows/python-tests.yml)
+[![E2E tests](https://github.com/leadhub-code/logline/actions/workflows/e2e-tests.yml/badge.svg)](https://github.com/leadhub-code/logline/actions/workflows/e2e-tests.yml)
+[![Docker build](https://github.com/leadhub-code/logline/actions/workflows/docker-build.yml/badge.svg)](https://github.com/leadhub-code/logline/actions/workflows/docker-build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Live synchronization of log files from multiple computers (usually VMs, servers…) to a single place.
 
-(Log file = a regular file that only grows (new content is only appended) and can be rotated.)
+A log file here means a regular file that only grows (new content is appended
+to it) and may be rotated.
 
-Consists of two pieces:
+Logline has two components:
 
-- **agent** reads the logs and sends their content to the server via (encrypted) TCP connection
-- **server** listens on a TCP port, receives data from agents and manages a mirror of the log files processed by agents
+- **agent** runs on every machine whose logs you want to collect. It follows the
+  log files and sends new content to the server over a TCP connection,
+  optionally encrypted with TLS.
+- **server** runs on a central machine. It receives the data from all agents
+  and keeps a mirror of their log files in a directory.
 
-The TCP connection can be encrypted via SSL/TLS – using a certificate for example from LetsEncrypt.org or a self-signed one.
+```mermaid
+flowchart LR
+    subgraph web1["web-1.example.com"]
+        direction TB
+        w1logs["/var/log/nginx/*.log<br/>/var/log/app/*.log"] --> w1agent["logline-agent"]
+    end
+    subgraph db1["db-1.example.com"]
+        direction TB
+        d1logs["/var/log/postgresql/*.log<br/>Docker json-file logs"] --> d1agent["logline-agent"]
+    end
+
+    w1agent -- "TCP :5645<br/>TLS + client token" --> server["logline-server"]
+    d1agent -- "TCP :5645<br/>TLS + client token" --> server
+    server --> mirror[("mirror directory<br/>&lt;dest&gt;/&lt;hostname&gt;/…")]
+```
+
+Features
+--------
+
+- **Live tailing** – new lines show up on the server within about a second.
+- **Rotation-aware** – follows files across rotations and keeps the rotated
+  segments on the server; optional [rotation markers](#rotation-markers) let a
+  rotation tool choose their names, and self-rotating sources such as Docker's
+  `json-file` driver are handled too.
+- **Resumable** – after a reconnect or restart the agent continues from the
+  server's current length instead of resending the whole file.
+- **Encrypted and authenticated** – optional TLS (Let's Encrypt or self-signed
+  certificate) and per-agent client tokens.
+- **Compressed transfer** – data chunks are gzipped whenever that makes them
+  smaller.
+- **Observable** – optional OpenTelemetry metrics and a ready-made
+  [Grafana dashboard](grafana/).
+- **Simple** – pure Python (3.9+), `asyncio`, a single dependency (PyYAML) plus
+  optional OpenTelemetry packages.
+
+Quick start
+-----------
+
+The agent and the server are separate Python packages living in the `agent/`
+and `server/` directories. Install them straight from Git, for example with
+[uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install "git+https://github.com/leadhub-code/logline#subdirectory=server"
+```
+
+```bash
+uv tool install "git+https://github.com/leadhub-code/logline#subdirectory=agent"
+```
+
+(For the optional metrics support use the `name[otel] @ url` form, e.g.
+`"logline-agent[otel] @ git+https://github.com/leadhub-code/logline#subdirectory=agent"`.)
+
+Generate a client token and compute its hash for the server (see
+[Authentication](#authentication)):
+
+```bash
+openssl rand -hex 32 > client-token
+```
+
+```bash
+python3 -c 'from hashlib import sha1; print(sha1(open("client-token", "rb").read().strip()).hexdigest())'
+```
+
+Run the server on the central machine (the destination directory must already
+exist):
+
+```bash
+mkdir -p /srv/logline
+```
+
+```bash
+logline-server --dest /srv/logline --client-token-hash <sha1-hex-from-above>
+```
+
+Run the agent on each machine:
+
+```bash
+logline-agent --server logs.example.com:5645 --token-file client-token --scan '/var/log/*.log'
+```
+
+This minimal setup sends the token and the logs in plaintext. For anything
+beyond a trusted network enable TLS: `--tls-cert` and `--tls-key` on the
+server, `--tls` (or `--tls-cert <ca.pem>` for a self-signed certificate) on the
+agent.
+
+The server image can also be built with Docker (it includes the metrics
+support). Its entrypoint is `logline-server`, so options can be passed directly
+(or use a config file via the `CONF_FILE` environment variable):
+
+```bash
+docker build -t logline-server server
+```
+
+```bash
+docker run -p 5645:5645 -v /srv/logline:/data logline-server --dest /data --client-token-hash <sha1-hex>
+```
+
+How the mirror looks
+--------------------
+
+The server stores every file under `<dest>/<hostname>/<mangled-directory>/`,
+where `<hostname>` is what `socket.getfqdn()` returns on the agent's machine
+and `<mangled-directory>` is the resolved (symlink-free) source directory with
+every `/` replaced with `~`. For example:
+
+```
+/srv/logline/                                         ← dest
+└── web-1.example.com/                                ← agent's hostname
+    ├── var~log~nginx/                                ← /var/log/nginx
+    │   ├── access.log                                ← live file
+    │   ├── access.log.20261105T000011Z.orphan        ← rotated segment
+    │   └── access.log.20261106T000000Z.bd0fe0ff5ceeb ← rotated segment named via markers
+    └── var~lib~docker~containers~3f2a…/
+        ├── 3f2a…-json.log                            ← live file
+        └── 3f2a…-json.log.orphan                     ← last self-rotated segment (ephemeral)
+```
+
+Configuration
+-------------
+
+Both programs accept command-line options (see `--help`) and a YAML config file
+passed via `--conf` (the server also reads the `CONF_FILE` environment
+variable). Relative file paths in a config file (`dest`, `log.file`, TLS files,
+`client_token_file`) are resolved relative to the config file itself; the glob
+patterns in `scan`, `exclude` and `ephemeral` are not, so make them absolute.
+Single-value command-line options take precedence over the config file; list
+options (`--scan`, `--client-token-hash`) are merged with it.
+
+### Agent
+
+```yaml
+server: logs.example.com:5645
+
+tls:
+  enabled: true
+  # cert: server-ca.pem   # CA bundle or self-signed cert to verify the server with
+  #                       # (also enables TLS); without it the system trust store is used
+
+client_token_file: client-token
+
+# Files to follow (Python glob syntax, `**` is recursive).
+scan:
+  - /var/log/*.log
+  - /var/log/nginx/*.log
+  - /var/lib/docker/containers/*/*-json.log
+
+exclude:
+  - /var/log/*-debug.log
+
+# Skip every matched file whose directory contains one of these files.
+exclude_if_file_present:
+  - .logline-ignore
+
+# Self-rotating sources without rotation markers, see below.
+ephemeral:
+  - /var/lib/docker/containers/*/*-json.log
+
+log:
+  file: logline-agent.log
+  level: info             # info (default) or debug
+
+metrics:
+  enabled: true
+  endpoint: http://localhost:4317
+```
+
+### Server
+
+```yaml
+bind: :5645               # default: all interfaces, port 5645
+dest: /srv/logline
+
+tls:
+  cert: fullchain.pem
+  key: privkey.pem
+  # key_password_file: key-password
+
+client_token_hashes:
+  - <sha1-hex-of-the-client-token>
+
+reuse_port: false         # see "Scaling the server"
+
+log:
+  file: logline-server.log
+  level: info
+
+metrics:
+  enabled: true
+  endpoint: http://localhost:4317
+```
 
 Authentication
 --------------
@@ -27,10 +226,11 @@ Configure it on the **agent** via one of (checked in this order):
 - `client_token_file` in the agent's config file (path relative to the config file)
 
 The **server** never stores the raw token, only its SHA-1 hex digest. Compute
-it with:
+it from the file holding the token, here `client-token` (surrounding
+whitespace is ignored, as the agent does when it reads a token file):
 
-```
-echo -n 'your-secret-token' | sha1sum
+```bash
+python3 -c 'from hashlib import sha1; print(sha1(open("client-token", "rb").read().strip()).hexdigest())'
 ```
 
 and configure it via `client_token_hashes` (a list) in the server's config
@@ -40,12 +240,78 @@ individually. If a connecting agent's token doesn't match, the server logs
 the hash it computed for the rejected token, which is convenient when
 provisioning a new agent.
 
+The TCP connection can be encrypted with TLS, using for example a certificate
+from Let's Encrypt or a self-signed one. Enable it on both sides: on the server
+with `tls.cert` and `tls.key`, on the agent with `tls.enabled` (plus `tls.cert`
+when the server's certificate is not trusted by the system).
+
+Rotation
+--------
+
+The agent is the sole authority on file identity and rotation; the server only
+appends bytes to the file the agent names and renames it when told to. The
+agent detects a rotation when a new file (a new inode) appears at the tailed
+path, as happens when a rotation tool moves the log aside and starts a fresh
+one. It then seals the old segment on the server under a new name and keeps
+draining it, while a new connection streams the new file:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as rotation tool
+    participant A as logline-agent
+    participant S as logline-server
+
+    Note over A,S: steady state – the agent streams foo.log into the live file foo.log
+    Note over R: move foo.log aside,<br/>start a new foo.log
+    Note over A: notice a new inode at foo.log
+    A->>S: old connection: rename foo.log → foo.log.#lt;iso_dt#gt;.orphan
+    S-->>A: ok (file and directory fsynced)
+    A->>S: new connection: stream the new inode into foo.log
+    A->>S: old connection: drain the rest of the old inode,<br/>close it after 10 minutes without growth
+```
+
+Before sealing, the agent waits up to about 10 seconds for an optional
+[rotation marker](#rotation-markers); without one, the new file starts
+streaming with that delay. `<iso_dt>` is the agent's UTC time when it seals the
+segment (`YYYYMMDDTHHMMSSZ`). The wire format and the naming rules are described
+in detail in [Protocol.md](Protocol.md).
+
+### Rotation markers
+
+A rotation tool can control the names of the rotated segments through the file
+names it uses. The agent watches the names of the files in the log's directory
+(it never reads their contents). When it finds one of the names below, it
+copies the timestamp and the hash from it instead of inventing its own, so the
+mirror uses the same names as the tool's archive:
+
+| File name | Effect |
+| --- | --- |
+| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. The agent waits up to about 10 seconds for it after it notices the rotation. |
+| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. It must use the same `<iso_dt>`. Until such a name appears, the agent keeps draining the old file, so a tool that produces the first name must eventually produce one of these too. |
+
+`<iso_dt>` must be exactly `YYYYMMDDTHHMMSSZ`, including seconds (e.g.
+`20261106T225900Z`), and `<sha13>` is 13 lowercase hex digits. Names in any
+other format are ignored: a malformed first name makes the rotation fall back
+to an `.orphan` name, a malformed second name leaves the segment draining under
+`foo.log.<iso_dt>`.
+
+The names come from lh-logrotate, an internal rotation tool that is not
+publicly available, which moves the log aside as
+`foo.log.<iso_dt>.lh-logrotate-waiting`; any rotation tool or script can use
+the same names. Without them everything still works; the rotated segments just
+keep their `.orphan` names.
+
+The agent tails every file its `scan` globs match, so keep them from matching
+these names: use patterns like `/var/log/*.log` rather than `/var/log/*`, or
+add an `exclude` such as `/var/log/*.lh-logrotate-*`. Otherwise the renamed log
+would be shipped a second time as a separate file.
+
 Ephemeral log sources
 ---------------------
 
-Most rotations are driven by lh-logrotate, which drops marker files the agent
-reads to name each archived segment. Some sources rotate on their own, without
-any markers — most notably Docker's `json-file` logging driver
+Some sources rotate on their own, without any rotation markers – most
+notably Docker's `json-file` logging driver
 (`/var/lib/docker/containers/<id>/<id>-json.log`), which self-rotates every few
 minutes. Each such markerless rotation is sealed server-side as an *orphan*, and
 by default every orphan gets a unique timestamped name, so they accumulate
@@ -64,9 +330,9 @@ ephemeral:
 
 A markerless rotation of an ephemeral source is sealed under the fixed name
 `<basename>.orphan` (no timestamp). Each rotation overwrites the previous orphan,
-so the server keeps at most two files per source — the live file and the last
-sealed segment — instead of an ever-growing pile. Marker-based (lh-logrotate)
-rotations of an ephemeral source are unaffected.
+so the server keeps at most two files per source – the live file and the last
+sealed segment – instead of an ever-growing pile. Marker-based rotations of an
+ephemeral source are unaffected.
 
 Scaling the server
 ------------------
@@ -81,3 +347,47 @@ On Linux all sockets sharing a port via `SO_REUSEPORT` must belong to the same
 effective user, which prevents other users from hijacking the port. Be aware,
 though, that any process running as the same user on the host can join the
 listening group.
+
+Monitoring
+----------
+
+With `metrics.enabled: true` (and the `otel` extra installed) both programs
+export OpenTelemetry metrics over OTLP/gRPC – to `metrics.endpoint`, the
+`OTEL_EXPORTER_OTLP_ENDPOINT` environment variable, or `localhost:4317`. Setting
+`OTEL_SDK_DISABLED=true` turns them off. An importable Grafana dashboard and
+notes on the expected collector setup live in [grafana/](grafana/).
+
+```mermaid
+flowchart LR
+    agents["logline-agent<br/>(every host)"] -- "OTLP/gRPC" --> otel["OpenTelemetry<br/>collector"]
+    server["logline-server"] -- "OTLP/gRPC" --> otel
+    otel --> prometheus[("Prometheus")]
+    prometheus --> grafana["Grafana<br/>dashboard"]
+```
+
+Development
+-----------
+
+The repository has three [uv](https://docs.astral.sh/uv/) projects: `agent`,
+`server` and `e2e_tests` (end-to-end tests that run both programs together).
+
+```bash
+make check   # ruff + pytest for every component
+```
+
+```bash
+make test    # tests only
+```
+
+```bash
+make lint    # ruff only
+```
+
+```bash
+make image   # build the server container image (uses podman)
+```
+
+License
+-------
+
+[MIT](LICENSE)
