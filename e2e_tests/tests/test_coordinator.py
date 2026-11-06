@@ -340,7 +340,8 @@ def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode)
             rotate_with_markers(src)
 
             final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
-            await wait_until(lambda: final.exists())
+            # a single failure is retried right away, without waiting for a backoff
+            await wait_until(lambda: final.exists(), timeout=0.8)
             assert failed, 'the simulated failure was not triggered'
             assert final.read_bytes() == LINE_ONE
             await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
@@ -348,6 +349,82 @@ def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode)
             assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
             # the agent resumed at the right offset after reconnecting
             assert protocol_errors == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def drop_first_rename_to(monkeypatch, fail_to):
+    original_handle_rename = server_main.handle_rename
+    dropped = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not dropped:
+            dropped.append(metadata)
+            raise ConnectionResetError('simulated connection drop before the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    return dropped
+
+
+def test_failed_rename_does_not_adopt_foreign_destination(tmp_path, monkeypatch):
+    # After a failed seal rename the destination name already holds a file that
+    # is not ours. The agent must not take it for its applied rename (and append
+    # to it); it has to retry the rename of its own data.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            (d / 'foo.log.{}'.format(ISO)).write_bytes(foreign)
+            rotate_with_markers(src)
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert dropped, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_failed_rename_of_unsent_segment_does_not_append_to_foreign_file(tmp_path, monkeypatch):
+    # Nothing of the old (empty) inode was sent, so the server has no source to
+    # rename, and the destination name holds a foreign file. The agent must not
+    # continue under that name and append its trailing bytes to the foreign file.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        foreign_path = d / 'foo.log.{}'.format(ISO)
+        foreign_path.write_bytes(foreign)
+        try:
+            await asyncio.sleep(0.1)
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(LINE_TWO)
+            await wait_until(lambda: bool(dropped))
+            with old.open('ab') as f:
+                # longer than the foreign file, so resuming at its length would append
+                f.write(b'trailing bytes of the old inode, written after the rotation\n' * 3)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            await asyncio.sleep(0.3)
+            assert foreign_path.read_bytes() == foreign
         finally:
             await cancel(task)
 
@@ -380,7 +457,7 @@ def test_persistently_failing_rename_backs_off(tmp_path, monkeypatch):
             await asyncio.sleep(2)
             assert len(attempts) <= 5
             # the live segment is unaffected
-            assert (d / 'foo.log').read_bytes() == LINE_TWO
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
         finally:
             await cancel(task)
 

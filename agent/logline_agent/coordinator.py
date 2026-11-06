@@ -244,6 +244,7 @@ class Segment:
             pass
         self.conn = None
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
             try:
@@ -290,7 +291,7 @@ class Segment:
             self._lag = self._stream_lag()
 
     async def _rename(self, src, dst, fail_closed=False):
-        backoff = RECONNECT_BACKOFF_MIN_SECONDS
+        retry_delay = 0
         while True:
             try:
                 await self.conn.send_rename(src, dst)
@@ -316,16 +317,22 @@ class Segment:
                 # Not applied. Reconnect targeting the source and retry the rename
                 # on that connection (the server's rename is idempotent).
                 if not await self._reconnect_to(src):
-                    # Neither name holds any data: nothing was ever sent, so there
-                    # is nothing to rename. Continue under the destination name.
+                    # The source holds no data: nothing was ever sent, so there is
+                    # nothing to rename. Continue under the destination name, but
+                    # only if it is free too -- never append to someone else's file.
+                    if await self._reconnect_to(dst):
+                        raise RuntimeError(
+                            'cannot rename {} -> {}: the source is gone and the destination '
+                            'holds a different file'.format(src, dst))
                     logger.info('rename %s -> %s on %s: nothing to rename on the server',
                                 src, dst, self.file_path)
-                    await self._reconnect_to(dst)
                     return
-                # Back off before retrying, so a rename the server keeps failing
-                # (e.g. a permission problem) is not retried in a tight loop.
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
+                # Retry the first failure right away (the server just answered two
+                # handshakes); back off after that, so a rename the server keeps
+                # failing (e.g. a permission problem) is not retried in a tight loop.
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                retry_delay = min(max(retry_delay * 2, RECONNECT_BACKOFF_MIN_SECONDS), RECONNECT_BACKOFF_MAX_SECONDS)
 
     async def _reconnect_to(self, target):
         '''
@@ -341,9 +348,8 @@ class Segment:
     def _remote_is_ours(self):
         '''Whether the target the server just reported holds the start of our inode.'''
         reply = self.conn.header_reply
-        prefix = self._read_prefix()[:reply['length']]
-        self.file_stream.seek(reply['length'])
-        return reply.get('prefix_sha1') == sha1_b64(prefix)
+        # The server hashed at most `length` bytes of the prefix sent in the handshake.
+        return reply.get('prefix_sha1') == sha1_b64(self._handshake_prefix[:reply['length']])
 
     def _read_prefix(self):
         self.file_stream.seek(0)
