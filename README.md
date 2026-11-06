@@ -76,7 +76,7 @@ openssl rand -hex 32 > client-token
 ```
 
 ```bash
-tr -d '\n' < client-token | sha1sum
+tr -d '[:space:]' < client-token | sha1sum
 ```
 
 Run the server on the central machine (the destination directory must already
@@ -224,7 +224,7 @@ The **server** never stores the raw token, only its SHA-1 hex digest. Compute
 it with:
 
 ```
-echo -n 'your-secret-token' | sha1sum
+printf '%s' 'your-secret-token' | sha1sum
 ```
 
 and configure it via `client_token_hashes` (a list) in the server's config
