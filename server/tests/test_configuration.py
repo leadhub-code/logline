@@ -81,3 +81,28 @@ def test_log_file_level_rejects_unknown_level(tmp_path):
     cfg_path = write_conf_with_log_level(tmp_path, 'trace')
     with pytest.raises(ConfigurationError):
         Configuration(args=make_args(conf=str(cfg_path)))
+
+
+def test_tls_key_password_defaults_to_none(tmp_path, monkeypatch):
+    # A TLS key without a password (e.g. from Let's Encrypt) is the common case;
+    # create_server() reads conf.tls_password unconditionally.
+    monkeypatch.delenv('TLS_KEY_PASSWORD', raising=False)
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(
+        'dest: dst\n'
+        'client_token_hashes: [dummyhash]\n'
+        'tls:\n  cert: cert.pem\n  key: key.pem\n')
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.use_tls is True
+    assert conf.tls_password is None
+
+
+def test_tls_section_with_all_keys_commented_out(tmp_path):
+    # YAML loads a section whose keys are all commented out as None.
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(
+        'dest: dst\n'
+        'client_token_hashes: [dummyhash]\n'
+        'tls:\n  # cert: cert.pem\n')
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.use_tls is False

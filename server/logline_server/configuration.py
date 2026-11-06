@@ -64,28 +64,33 @@ class Configuration:
         else:
             raise ConfigurationError('Destination directory not configured')
 
+        # `tls:` with all keys commented out loads as None, hence `or {}`.
+        tls_cfg = cfg.get('tls') or {}
+
         if args.tls_cert:
             self.tls_cert_file = Path(args.tls_cert)
-        elif cfg.get('tls', {}).get('cert'):
-            self.tls_cert_file = cfg_dir / cfg['tls']['cert']
+        elif tls_cfg.get('cert'):
+            self.tls_cert_file = cfg_dir / tls_cfg['cert']
         else:
             self.tls_cert_file = None
 
         if args.tls_key:
             self.tls_key_file = Path(args.tls_key)
-        elif cfg.get('tls', {}).get('key'):
-            self.tls_key_file = cfg_dir / cfg['tls']['key']
+        elif tls_cfg.get('key'):
+            self.tls_key_file = cfg_dir / tls_cfg['key']
         else:
             self.tls_key_file = None
 
         if args.tls_key_password_file:
             self.tls_password = Path(args.tls_key_password_file).read_text().strip()
-        elif cfg.get('tls', {}).get('key_password_file'):
-            self.tls_password = (cfg_dir / cfg['tls']['key_password_file']).read_text().strip()
-        elif cfg.get('tls', {}).get('key_password'):
-            self.tls_password = cfg['tls']['key_password']
+        elif tls_cfg.get('key_password_file'):
+            self.tls_password = (cfg_dir / tls_cfg['key_password_file']).read_text().strip()
+        elif tls_cfg.get('key_password'):
+            self.tls_password = tls_cfg['key_password']
         elif os.environ.get('TLS_KEY_PASSWORD'):
             self.tls_password = os.environ['TLS_KEY_PASSWORD']
+        else:
+            self.tls_password = None
 
         self.use_tls = bool(self.tls_cert_file)
 

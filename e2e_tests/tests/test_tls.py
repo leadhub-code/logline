@@ -10,6 +10,8 @@ from textwrap import dedent
 from time import monotonic as monotime
 from time import sleep
 
+import pytest
+
 
 logger = getLogger(__name__)
 
@@ -116,10 +118,19 @@ selfsigned_key_pem = dedent('''\
 selfsigned_key_password = 'topsecret'
 
 
-def test_send_log_file_over_tls(tmp_path):
+@pytest.mark.parametrize('encrypted_key', [True, False], ids=['encrypted-key', 'plain-key'])
+def test_send_log_file_over_tls(tmp_path, encrypted_key):
     chdir(tmp_path)
     Path('cert.pem').write_text(selfsigned_cert_pem)
     Path('key.pem').write_text(selfsigned_key_pem)
+    server_env = {k: v for k, v in os.environ.items() if k != 'TLS_KEY_PASSWORD'}
+    if encrypted_key:
+        key_file = 'key.pem'
+        server_env['TLS_KEY_PASSWORD'] = selfsigned_key_password
+    else:
+        # A key without a password (e.g. from Let's Encrypt) is the common case.
+        key_file = 'key-plain.pem'
+        check_call(['openssl', 'pkey', '-in', 'key.pem', '-passin', f'pass:{selfsigned_key_password}', '-out', key_file])
     Path('agent-src').mkdir()
     Path('server-dst').mkdir()
     Path('agent-src/sample.log').write_text('2021-02-22 Hello world!\n')
@@ -139,10 +150,10 @@ def test_send_log_file_over_tls(tmp_path):
             '--bind', f'localhost:{port}',
             '--dest', 'server-dst',
             '--tls-cert', 'cert.pem',
-            '--tls-key', 'key.pem',
+            '--tls-key', key_file,
             '--client-token-hash', client_token_hash,
         ]
-        server_process = stack.enter_context(Popen(server_cmd, env={**os.environ, 'TLS_KEY_PASSWORD': selfsigned_key_password}))
+        server_process = stack.enter_context(Popen(server_cmd, env=server_env))
         stack.callback(terminate_process, server_process)
         sleep(.1)
         agent_process = stack.enter_context(Popen(agent_cmd, env={**os.environ, 'CLIENT_TOKEN': client_token}))

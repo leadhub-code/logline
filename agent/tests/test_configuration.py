@@ -39,3 +39,9 @@ def test_log_file_level_is_case_insensitive(temp_dir):
 def test_log_file_level_rejects_unknown_level(temp_dir):
     with pytest.raises(ConfigurationError):
         load_conf(temp_dir, BASE_CONF + 'log:\n  level: trace\n')
+
+
+def test_tls_section_with_all_keys_commented_out(temp_dir):
+    # YAML loads a section whose keys are all commented out as None.
+    conf = load_conf(temp_dir, BASE_CONF + 'tls:\n  # enabled: true\n')
+    assert not conf.use_tls

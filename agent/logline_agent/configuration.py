@@ -75,10 +75,13 @@ class Configuration:
         else:
             raise ConfigurationError('No server address configured')
 
+        # `tls:` with all keys commented out loads as None, hence `or {}`.
+        tls_cfg = cfg.get('tls') or {}
+
         if args.tls_cert:
             self.tls_cert_file = Path(args.tls_cert)
-        elif cfg.get('tls', {}).get('cert'):
-            self.tls_cert_file = cfg_dir / cfg['tls']['cert']
+        elif tls_cfg.get('cert'):
+            self.tls_cert_file = cfg_dir / tls_cfg['cert']
         else:
             self.tls_cert_file = None
 
@@ -87,8 +90,8 @@ class Configuration:
 
         self.use_tls = args.tls \
             or self.tls_cert_file \
-            or cfg.get('tls', {}).get('enable') \
-            or cfg.get('tls', {}).get('enabled')
+            or tls_cfg.get('enable') \
+            or tls_cfg.get('enabled')
 
         if args.token_file:
             self.client_token = Path(args.token_file).read_text().strip()
