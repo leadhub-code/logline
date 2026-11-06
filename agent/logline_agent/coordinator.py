@@ -83,6 +83,7 @@ class Segment:
         self.ephemeral = ephemeral
 
         self.conn = None
+        self._handshake_prefix = b''    # prefix sent in the latest handshake
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
@@ -146,8 +147,9 @@ class Segment:
         # for an ephemeral orphan the destination is the shared fixed
         # `<basename>.orphan`, which a later rotation may already have clobbered
         # with a newer segment. The generic `_rename` retry reconnects to the
-        # destination and treats "it exists" as success -- unsafe here, since we
-        # could adopt (and resume onto) that newer file. So we fail closed.
+        # destination and treats "it holds the start of our file" as success --
+        # unsafe here, since a newer orphan of a repetitive source can start with
+        # the same bytes, and we could adopt (and resume onto) it. So we fail closed.
         await self._rename(self.target, seal_name, fail_closed=self.ephemeral and is_orphan)
         logger.info('Sealed %s as %s', self.file_path, seal_name)
         self.target = seal_name
@@ -198,6 +200,7 @@ class Segment:
 
     async def _connect(self):
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         self.conn = await self.server(
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply
@@ -243,6 +246,7 @@ class Segment:
             pass
         self.conn = None
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
             try:
@@ -289,6 +293,7 @@ class Segment:
             self._lag = self._stream_lag()
 
     async def _rename(self, src, dst, fail_closed=False):
+        retry_delay = 0
         while True:
             try:
                 await self.conn.send_rename(src, dst)
@@ -306,13 +311,47 @@ class Segment:
                     raise _EndSegment() from e
                 logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
                                src, dst, self.file_path, e)
-                # Reconnect targeting the destination: the rename may already be
-                # applied server-side (it is idempotent), or still pending.
-                self.target = dst
-                await self._reconnect()
-                if self.conn.header_reply['length'] >= 0:
-                    # server now holds `dst`; the rename is effectively done
+                # The failure does not tell whether the server applied the rename.
+                # Ask it: reconnect targeting the destination; if that holds our
+                # data, the rename is done.
+                if await self._reconnect_to(dst) and self._remote_is_ours():
                     return
+                # Not applied. Reconnect targeting the source and retry the rename
+                # on that connection (the server's rename is idempotent).
+                if not await self._reconnect_to(src):
+                    # The source holds no data: nothing was ever sent, so there is
+                    # nothing to rename. Continue under the destination name, but
+                    # only if it is free too -- never append to someone else's file.
+                    if await self._reconnect_to(dst):
+                        raise RuntimeError(
+                            'cannot rename {} -> {}: the source is gone and the destination '
+                            'holds a different file'.format(src, dst))
+                    logger.info('rename %s -> %s on %s: nothing to rename on the server',
+                                src, dst, self.file_path)
+                    return
+                # Retry the first failure right away (the server just answered two
+                # handshakes); back off after that, so a rename the server keeps
+                # failing (e.g. a permission problem) is not retried in a tight loop.
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                retry_delay = min(max(retry_delay * 2, RECONNECT_BACKOFF_MIN_SECONDS), RECONNECT_BACKOFF_MAX_SECONDS)
+
+    async def _reconnect_to(self, target):
+        '''
+        Reconnect with ``target`` as this segment's target and continue reading
+        where the server's copy ends. Return the server's length of ``target``.
+        '''
+        self.target = target
+        await self._reconnect()
+        length = self.conn.header_reply['length']
+        self.file_stream.seek(length)
+        return length
+
+    def _remote_is_ours(self):
+        '''Whether the target the server just reported holds the start of our inode.'''
+        reply = self.conn.header_reply
+        # The server hashed at most `length` bytes of the prefix sent in the handshake.
+        return reply.get('prefix_sha1') == sha1_b64(self._handshake_prefix[:reply['length']])
 
     def _read_prefix(self):
         self.file_stream.seek(0)

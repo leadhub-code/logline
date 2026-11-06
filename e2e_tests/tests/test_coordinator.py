@@ -13,9 +13,12 @@ from socket import getfqdn
 from time import monotonic
 from types import SimpleNamespace
 
+from logline_agent import coordinator as coordinator_module
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
+import logline_server.main as server_main
 from logline_server.main import handle_client, sha1_hex
+import pytest
 
 
 CLIENT_TOKEN = 'topsecret'
@@ -286,6 +289,203 @@ def test_no_write_before_seal_recovery(tmp_path):
             assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
             # and the new content is streamed cleanly into the live target
             await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+# Lines longer than the agent's 50-byte prefix, so a wrong read position after
+# a reconnect would show up as an offset mismatch on the server.
+LINE_ONE = b'2026-01-01 12:00:00 line one, long enough to exceed the agent prefix length\n'
+LINE_TWO = b'2026-01-01 12:05:00 line two, long enough to exceed the agent prefix length\n'
+
+
+def rotate_with_markers(src):
+    rotate_aside(src, 'foo.log', ISO)
+    (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+    (src / 'foo.log').write_bytes(LINE_TWO)
+    (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+
+
+@pytest.mark.parametrize('failing_rename', ['seal', 'finalize'])
+@pytest.mark.parametrize('mode', ['dropped', 'reply-lost'])
+def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode):
+    # The connection fails around a rename frame: either before the server
+    # applies it (e.g. the server is restarting), or after it applied it but
+    # before the reply reached the agent. The agent must find out which one
+    # happened and end up with the rename applied exactly once.
+    fail_to = 'foo.log.{}'.format(ISO) if failing_rename == 'seal' else 'foo.log.{}.{}'.format(ISO, SHA13)
+    original_handle_rename = server_main.handle_rename
+    failed = []
+    protocol_errors = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not failed:
+            failed.append(metadata)
+            if mode == 'reply-lost':
+                original_handle_rename(dst_dir, current_path, f, metadata)
+            raise ConnectionResetError('simulated connection drop around the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    monkeypatch.setattr(server_main, 'record_protocol_error', protocol_errors.append)
+    # A backoff this long would time the test out, so it fails if the first
+    # retry is delayed by the backoff.
+    monkeypatch.setattr(coordinator_module, 'RECONNECT_BACKOFF_MIN_SECONDS', 30)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            # a single failure is retried right away, without waiting for a backoff
+            await wait_until(lambda: final.exists())
+            assert failed, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            # no leftover sealed segment and no duplicate copy sealed aside as an orphan
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+            # the agent resumed at the right offset after reconnecting
+            assert protocol_errors == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def drop_first_rename_to(monkeypatch, fail_to):
+    original_handle_rename = server_main.handle_rename
+    dropped = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not dropped:
+            dropped.append(metadata)
+            raise ConnectionResetError('simulated connection drop before the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    return dropped
+
+
+def test_failed_rename_does_not_adopt_foreign_destination(tmp_path, monkeypatch):
+    # After a failed seal rename the destination name already holds a file that
+    # is not ours. The agent must not take it for its applied rename (and append
+    # to it); it has to retry the rename of its own data.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            (d / 'foo.log.{}'.format(ISO)).write_bytes(foreign)
+            rotate_with_markers(src)
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert dropped, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_failed_rename_of_unsent_segment_does_not_append_to_foreign_file(tmp_path, monkeypatch):
+    # Nothing of the old (empty) inode was sent, so the server has no source to
+    # rename, and the destination name holds a foreign file. The agent must not
+    # continue under that name and append its trailing bytes to the foreign file.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        foreign_path = d / 'foo.log.{}'.format(ISO)
+        foreign_path.write_bytes(foreign)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(LINE_TWO)
+            await wait_until(lambda: bool(dropped))
+            with old.open('ab') as f:
+                # longer than the foreign file, so resuming at its length would append
+                f.write(b'trailing bytes of the old inode, written after the rotation\n' * 3)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            await asyncio.sleep(0.3)
+            assert foreign_path.read_bytes() == foreign
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_persistently_failing_rename_backs_off(tmp_path, monkeypatch):
+    # A rename the server can never apply (e.g. a permission problem in the
+    # destination directory) must not be retried in a tight loop.
+    attempts = []
+
+    def failing_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == 'foo.log.{}.{}'.format(ISO, SHA13):
+            attempts.append(metadata)
+            raise PermissionError('simulated permanent rename failure')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    original_handle_rename = server_main.handle_rename
+    monkeypatch.setattr(server_main, 'handle_rename', failing_handle_rename)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
+            await wait_until(lambda: bool(attempts))
+            await asyncio.sleep(2)
+            assert len(attempts) <= 5
+            # the live segment is unaffected
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_of_empty_file_with_markers(tmp_path):
+    # Nothing was ever sent for the old (empty) inode, so the server holds
+    # neither the source nor the destination name of the seal and finalize
+    # renames. The agent must carry on rather than get stuck retrying them.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await asyncio.sleep(0.1)
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+            await asyncio.sleep(0.3)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
         finally:
             await cancel(task)
 
