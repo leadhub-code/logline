@@ -36,9 +36,9 @@ Features
 
 - **Live tailing** – new lines show up on the server within about a second.
 - **Rotation-aware** – follows files across rotations and keeps the rotated
-  segments on the server under the same names that
-  [lh-logrotate](#rotation) gives the archived files; markerless rotations
-  (e.g. Docker's `json-file` driver) are handled too.
+  segments on the server; optional [marker files](#rotation-markers) let a
+  rotation tool choose their names, and self-rotating sources such as Docker's
+  `json-file` driver are handled too.
 - **Resumable** – after a reconnect or restart the agent continues from the
   server's current length instead of resending the whole file.
 - **Encrypted and authenticated** – optional TLS (Let's Encrypt or self-signed
@@ -126,8 +126,8 @@ every `/` replaced with `~`. For example:
 └── web-1.example.com/                                ← agent's hostname
     ├── var~log~nginx/                                ← /var/log/nginx
     │   ├── access.log                                ← live file
-    │   ├── access.log.20261105T000000Z.bd0fe0ff5ceeb ← finalized lh-logrotate segment
-    │   └── access.log.20261106T000000Z               ← just rotated, still draining
+    │   ├── access.log.20261105T000000Z.orphan        ← rotated segment
+    │   └── access.log.20261106T000000Z.bd0fe0ff5ceeb ← rotated segment named via markers
     └── var~lib~docker~containers~3f2a…/
         ├── 3f2a…-json.log                            ← live file
         └── 3f2a…-json.log.orphan                     ← last self-rotated segment (ephemeral)
@@ -168,7 +168,7 @@ exclude:
 exclude_if_file_present:
   - .logline-ignore
 
-# Self-rotating sources without lh-logrotate markers, see below.
+# Self-rotating sources without rotation markers, see below.
 ephemeral:
   - /var/lib/docker/containers/*/*-json.log
 
@@ -244,38 +244,53 @@ Rotation
 --------
 
 The agent is the sole authority on file identity and rotation; the server only
-appends bytes to the file the agent names and renames it when told to. Most
-rotations are driven by lh-logrotate, which drops marker files next to the log. The agent reads those markers and
-parrots their timestamp and hash, so the mirror ends up with the same names as
-the archived files (minus the `.xz.gpg` suffix):
+appends bytes to the file the agent names and renames it when told to. The
+agent detects a rotation when a new file (a new inode) appears at the tailed
+path, as happens when a rotation tool moves the log aside and starts a fresh
+one. It then seals the old segment on the server under a new name and keeps
+draining it, while a new connection streams the new file:
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant R as lh-logrotate
+    participant R as rotation tool
     participant A as logline-agent
     participant S as logline-server
 
     Note over A,S: steady state – the live segment streams foo.log into foo.log
-    Note over R: rotate foo.log → foo.log.#lt;iso_dt#gt;<br/>+ .lh-logrotate-waiting marker
+    Note over R: move foo.log aside,<br/>start a new foo.log
     Note over A: notice a new inode at foo.log
-    A->>S: old connection: rename foo.log → foo.log.#lt;iso_dt#gt;
-    S-->>A: ok
-    A->>S: new connection: stream the new inode into foo.log
-    A->>S: old connection: drain the rest of the old inode
-    Note over R: compress + encrypt<br/>+ .lh-logrotate-compressed<br/>marker with #lt;sha13#gt;
-    A->>S: old connection: rename → foo.log.#lt;iso_dt#gt;.#lt;sha13#gt;
+    A->>S: old connection: rename foo.log → foo.log.#lt;iso_dt#gt;.orphan
     S-->>A: ok (file and directory fsynced)
+    A->>S: new connection: stream the new inode into foo.log
+    A->>S: old connection: drain the rest of the old inode,<br/>close it once it stops growing
 ```
 
-A rotation without any marker is sealed as an *orphan*,
-`foo.log.<iso_dt>.orphan`. The wire format and the naming rules are described
-in detail in [Protocol.md](Protocol.md).
+`<iso_dt>` is the UTC time of the rotation (`YYYYMMDDTHHMMSSZ`). The wire format
+and the naming rules are described in detail in [Protocol.md](Protocol.md).
+
+### Rotation markers
+
+A rotation tool can control the names of the rotated segments by creating empty
+marker files next to the log. The agent then copies the timestamp and the hash
+from the markers instead of inventing its own, so the mirror uses the same
+names as the tool's archive:
+
+| Marker file | Effect |
+| --- | --- |
+| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. Create it when the log is moved aside; the agent waits up to 10 seconds for it after it notices the rotation. |
+| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these appears, the agent keeps draining the old file. |
+
+`<iso_dt>` uses the `YYYYMMDDTHHMMSSZ` format and `<sha13>` is 13 lowercase hex
+digits. The marker names come from lh-logrotate, an internal rotation tool that
+is not publicly available, but any rotation tool or script can create them.
+Without markers everything still works; the rotated segments just keep their
+`.orphan` names.
 
 Ephemeral log sources
 ---------------------
 
-Some sources rotate on their own, without any lh-logrotate markers — most
+Some sources rotate on their own, without any rotation markers — most
 notably Docker's `json-file` logging driver
 (`/var/lib/docker/containers/<id>/<id>-json.log`), which self-rotates every few
 minutes. Each such markerless rotation is sealed server-side as an *orphan*, and
@@ -296,8 +311,8 @@ ephemeral:
 A markerless rotation of an ephemeral source is sealed under the fixed name
 `<basename>.orphan` (no timestamp). Each rotation overwrites the previous orphan,
 so the server keeps at most two files per source — the live file and the last
-sealed segment — instead of an ever-growing pile. Marker-based (lh-logrotate)
-rotations of an ephemeral source are unaffected.
+sealed segment — instead of an ever-growing pile. Marker-based rotations of an
+ephemeral source are unaffected.
 
 Scaling the server
 ------------------
