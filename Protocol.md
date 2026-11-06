@@ -14,15 +14,35 @@ appends bytes to that target and renames it when told to. It never decides file
 identity from content – the content prefix is reported/verified only as an
 integrity check, never used for routing or rotation.
 
+Framing
+-------
+
+Every message starts with an ASCII command line
+`<command> <metadata-length> [<data-length>]\n`, followed by `<metadata-length>`
+bytes of JSON metadata and, when `<data-length>` is present, that many bytes of
+raw payload. The agent ends its JSON metadata with `\n`, which is counted in
+`<metadata-length>`.
+
+The server answers every message with a reply line: either `ok\n`, or
+`ok <length>\n` followed by exactly `<length>` bytes of JSON (without a trailing
+newline).
+
+On any error – failed authentication, an invalid header, an offset mismatch, a
+malformed frame, and so on – the server logs it and closes the connection
+**without sending a reply**. It also closes a new connection that does not send
+its first command within 30 seconds. The agent treats a closed connection as a
+failure and reconnects; the handshake reply then tells it where to resume. (The
+agent also understands an `error` reply line, but the server never sends one.)
+
 Handshake
 ---------
 
 ```
 Agent (A) connects to Server (S)
-A: logline-agent-v1 153\n
+A: logline-agent-v1 186\n
 A: {"hostname": "server.example.com", "directory": "/var/log", "target": "something.log", "prefix": {"length": 42, "sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}, "auth": {"client_token": "..."}}\n
-S: ok 44\n
-S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}\n
+S: ok 62\n
+S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}
 ```
 
 The agent sends the source `directory` and the destination leaf `target`
@@ -30,10 +50,13 @@ separately. The server maps `directory` to `<dest>/<hostname>/<mangled-directory
 (each `/` becomes `~`) and writes to `<that directory>/<target>`; it never derives
 a filename from content. It opens the target if it exists and **reports** its
 current `length` and the SHA-1 (base64) of its first `prefix.length` bytes as
-`prefix_sha1` (`null` if the target does not exist). The server never rotates. The
-agent compares `prefix_sha1` with the inode it intends to stream and decides what
-to do (resume, or seal a stale target aside first). A handshake without a valid
-`target` is rejected.
+`prefix_sha1` (`length` 0 and `prefix_sha1` `null` if the target does not exist
+or is empty). The server never rotates. The agent compares `prefix_sha1` with the
+inode it intends to stream and decides what to do (resume, or seal a stale
+target aside first). A handshake without a valid `target` is rejected.
+
+The handshake does not create the target. The server creates it on the first
+`data` frame, which must then have `offset` 0.
 
 Data
 ----
@@ -45,8 +68,8 @@ A: now the Agent sends the raw log file content
 S: ok\n
 ```
 
-The server **must** verify that `offset` equals the current length of the target
-and replies with an explicit protocol error (closing the connection) on mismatch.
+The server **must** verify that `offset` equals the current length of the target;
+on mismatch it closes the connection (see [Framing](#framing)).
 `compression` may be `null`, `"gzip"`, `"lzma"` or `"zst"`.
 
 Rename
@@ -57,7 +80,7 @@ whose open fd holds the file being renamed. The open fd survives the rename, so 
 relabel and the subsequent trailing-byte appends stay strictly ordered.
 
 ```
-A: rename 78\n
+A: rename 85\n
 A: {"from": "foo.log.20260101T120000Z", "to": "foo.log.20260101T120000Z.bd0fe0ff5ceeb"}\n
 S: ok\n
 ```
@@ -74,8 +97,12 @@ Rotation naming
 Across a rotation there are briefly two connections targeting **distinct** names:
 the closing segment draining the old inode into `foo.log.<iso_dt>` and the new live
 segment streaming into `foo.log`. The agent parrots lh-logrotate's `<iso_dt>` and
-`<sha13>` from its on-disk marker files, so the live mirror name equals the
-eventual archived name minus the `.xz`/`.gpg` suffixes:
+`<sha13>` from the file names it finds in the log's directory, so the finalized
+mirror name equals lh-logrotate's archived name minus the `.xz.gpg` suffix.
+lh-logrotate renames the rotated log to `foo.log.<iso_dt>.lh-logrotate-waiting`,
+which gives the agent `<iso_dt>`; a later
+`foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed` (or `-uploaded`) name
+gives it `<sha13>`. The agent only matches the names and never reads the files:
 
 ```
 foo.log                                  (live segment)
