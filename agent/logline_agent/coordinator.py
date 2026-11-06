@@ -208,8 +208,14 @@ class Segment:
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
+        # The server copy of our inode can never be longer than the inode itself
+        # (it only holds bytes we sent). A longer remote is a different file; this
+        # also catches an empty new inode, whose empty prefix the server reports
+        # as `prefix_sha1` null and so cannot be compared.
+        local_length = fstat(self.file_stream.fileno()).st_size
         if (self.role_live and server_length > 0
-                and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
+                and (server_length > local_length
+                     or reply.get('prefix_sha1') not in (None, sha1_b64(prefix)))):
             await self._seal_stale_remote(prefix, server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 
