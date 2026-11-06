@@ -17,4 +17,11 @@ jobs:
     steps:
     - uses: actions/checkout@v6
     - name: Build the Docker image for Logline Server
-      run: docker build server --tag logline-server:$(date +%s)
+      env:
+        # On pull_request events github.sha is the temporary merge commit; use the PR head instead.
+        GIT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: docker build server --tag logline-server:ci --build-arg GIT_COMMIT="$GIT_COMMIT"
+    - name: Smoke test the image
+      run: |
+        docker run --rm logline-server:ci --help >/dev/null
+        docker run --rm logline-server:ci --version

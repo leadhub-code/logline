@@ -30,6 +30,7 @@ from .telemetry import (
     shutdown_metrics,
 )
 from .util import decompress_zst
+from .version import VersionAction
 
 
 logger = getLogger(__name__)
@@ -44,6 +45,7 @@ handshake_timeout = 30
 
 def server_main():
     p = ArgumentParser()
+    p.add_argument('--version', action=VersionAction)
     p.add_argument('--conf', help='path to configuration file')
     p.add_argument('--log', help='path to log file')
     p.add_argument('--verbose', '-v', action='store_true')
