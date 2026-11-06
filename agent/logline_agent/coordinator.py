@@ -197,19 +197,33 @@ class Segment:
     # -- connection / IO ---------------------------------------------------
 
     async def _connect(self):
+        # Measure the local length before reading the prefix: the server copy of
+        # this inode only holds bytes read even earlier, so it can never be longer
+        # than this. Measuring later would let the file grow in between and hide
+        # a stale remote (e.g. an empty prefix followed by fast writes).
+        local_length = fstat(self.file_stream.fileno()).st_size
         prefix = self._read_prefix()
         self.conn = await self.server(
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply
         server_length = reply['length']
-        # Resume detection compares only the first ``prefix_length_bytes`` (~50).
+        # Resume detection compares only the first ``prefix_length_bytes`` (~50),
+        # or fewer when the remote copy is shorter than that.
         # It is weakest for repetitive sources whose segments share an identical
         # prefix across rotations (e.g. health-check spam in Docker json logs):
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
+        # A remote longer than the local file is not our copy of this inode (a
+        # different file, or this one truncated in place). This also covers an
+        # empty new inode: its empty prefix makes the server report
+        # `prefix_sha1` null, which is never treated as a match.
+        # The server hashes at most `server_length` bytes of the prefix we sent,
+        # so compare only that much: a correct copy shorter than the prefix (a log
+        # that was still short when the agent stopped) must not look different.
         if (self.role_live and server_length > 0
-                and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
+                and (server_length > local_length
+                     or reply.get('prefix_sha1') != sha1_b64(prefix[:server_length]))):
             await self._seal_stale_remote(prefix, server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 

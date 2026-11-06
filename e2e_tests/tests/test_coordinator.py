@@ -34,7 +34,7 @@ def make_agent_conf(port):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
-        prefix_length_bytes=50, min_prefix_length_bytes=20,
+        prefix_length_bytes=50,
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
@@ -262,6 +262,124 @@ def test_ephemeral_orphan_closing_failure_does_not_resume(tmp_path):
                 f.write(b'body two continues\n')
             await wait_until(lambda: (d / 'foo.log').read_bytes()
                              == b'body two\nbody two continues\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_empty_new_file_does_not_resume_onto_stale_remote(tmp_path):
+    async def scenario(src, dst, conf):
+        # The agent missed a rotation (e.g. it was down): the server still holds
+        # the old segment under the live target, and the new inode is still empty.
+        # An empty file has an empty prefix, so the prefix comparison alone cannot
+        # tell the two files apart.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'OLD stale content from a missed segment\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
+
+            # the new file must arrive complete, not cut off at the old length
+            # and appended after the stale content
+            foo.write_bytes(b'NEW line one\nNEW line two, long enough to pass the old length\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes()
+                             == b'NEW line one\nNEW line two, long enough to pass the old length\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_empty_prefix_then_growth_during_handshake(tmp_path):
+    # Same missed rotation as above, but the producer writes more than the old
+    # segment's length while the first handshake is in flight: the prefix was
+    # read while the file was still empty, the file is long by the time the
+    # reply arrives. The stale remote must still be sealed aside.
+    old = b'OLD stale content from a missed segment\n'
+    new = b'NEW line one\nNEW line two, long enough to pass the old length\n'
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(old)
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        calls = []
+
+        async def factory(**kwargs):
+            conn = await connect_to_server(conf=conf, **kwargs)
+            if not calls:
+                with foo.open('ab') as f:
+                    f.write(new)
+            calls.append(kwargs)
+            return conn
+
+        coord = PathCoordinator(conf, foo.resolve(), factory)
+        task = asyncio.create_task(coord.run())
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == new)
+            orphans = [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            assert [o.read_bytes() for o in orphans] == [old]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_resume_onto_remote_shorter_than_prefix(tmp_path):
+    # The server holds a correct copy of our inode that is shorter than the
+    # agent's 50-byte prefix (the log was short when the agent stopped), and the
+    # file grew while the agent was down. The server can only hash the bytes it
+    # has, so the agent must compare just that much of its prefix and resume,
+    # instead of sealing the correct copy aside and re-sending it.
+    short = b'service started\n'
+    more = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(short)
+        foo = src / 'foo.log'
+        foo.write_bytes(short + more)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == short + more)
+            await asyncio.sleep(0.1)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_short_stale_remote_with_different_content_is_sealed(tmp_path):
+    # Negative control for the test above: a remote shorter than the prefix that
+    # is NOT the start of our file must still be sealed aside, even though the
+    # local file is longer (so the length check alone does not catch it).
+    stale = b'old segment\n'
+    current = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(stale)
+        foo = src / 'foo.log'
+        foo.write_bytes(current)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == stale
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == current)
         finally:
             await cancel(task)
 
