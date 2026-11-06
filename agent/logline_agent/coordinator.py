@@ -197,6 +197,11 @@ class Segment:
     # -- connection / IO ---------------------------------------------------
 
     async def _connect(self):
+        # Measure the local length before reading the prefix: the server copy of
+        # this inode only holds bytes read even earlier, so it can never be longer
+        # than this. Measuring later would let the file grow in between and hide
+        # a stale remote (e.g. an empty prefix followed by fast writes).
+        local_length = fstat(self.file_stream.fileno()).st_size
         prefix = self._read_prefix()
         self.conn = await self.server(
             log_path=self.file_path, target=self.target, log_prefix=prefix)
@@ -208,14 +213,13 @@ class Segment:
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
-        # The server copy of our inode can never be longer than the inode itself
-        # (it only holds bytes we sent). A longer remote is a different file; this
-        # also catches an empty new inode, whose empty prefix the server reports
-        # as `prefix_sha1` null and so cannot be compared.
-        local_length = fstat(self.file_stream.fileno()).st_size
+        # A remote longer than the local file is not our copy of this inode (a
+        # different file, or this one truncated in place). This also covers an
+        # empty new inode: its empty prefix makes the server report
+        # `prefix_sha1` null, which is never treated as a match.
         if (self.role_live and server_length > 0
                 and (server_length > local_length
-                     or reply.get('prefix_sha1') not in (None, sha1_b64(prefix)))):
+                     or reply.get('prefix_sha1') != sha1_b64(prefix))):
             await self._seal_stale_remote(prefix, server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 

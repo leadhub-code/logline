@@ -298,6 +298,42 @@ def test_empty_new_file_does_not_resume_onto_stale_remote(tmp_path):
     run(tmp_path, scenario)
 
 
+def test_empty_prefix_then_growth_during_handshake(tmp_path):
+    # Same missed rotation as above, but the producer writes more than the old
+    # segment's length while the first handshake is in flight: the prefix was
+    # read while the file was still empty, the file is long by the time the
+    # reply arrives. The stale remote must still be sealed aside.
+    old = b'OLD stale content from a missed segment\n'
+    new = b'NEW line one\nNEW line two, long enough to pass the old length\n'
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(old)
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        calls = []
+
+        async def factory(**kwargs):
+            conn = await connect_to_server(conf=conf, **kwargs)
+            if not calls:
+                with foo.open('ab') as f:
+                    f.write(new)
+            calls.append(kwargs)
+            return conn
+
+        coord = PathCoordinator(conf, foo.resolve(), factory)
+        task = asyncio.create_task(coord.run())
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == new)
+            orphans = [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            assert [o.read_bytes() for o in orphans] == [old]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
 def test_no_write_before_seal_recovery(tmp_path):
     async def scenario(src, dst, conf):
         # server already holds a different (older) file under the live target
