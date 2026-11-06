@@ -30,9 +30,11 @@ newline).
 On any error – failed authentication, an invalid header, an offset mismatch, a
 malformed frame, and so on – the server logs it and closes the connection
 **without sending a reply**. It also closes a new connection that does not send
-its first command within 30 seconds. The agent treats a closed connection as a
-failure and reconnects; the handshake reply then tells it where to resume. (The
-agent also understands an `error` reply line, but the server never sends one.)
+its first command within 30 seconds. The only exception is a first line that
+looks like an HTTP request: the server answers it with an HTTP 404 response
+before closing. The agent normally treats a closed connection as a failure and
+reconnects; the handshake reply then tells it where to resume. (The agent also
+understands an `error` reply line, but the server never sends one.)
 
 Handshake
 ---------
@@ -51,12 +53,13 @@ separately. The server maps `directory` to `<dest>/<hostname>/<mangled-directory
 a filename from content. It opens the target if it exists and **reports** its
 current `length` and the SHA-1 (base64) of its first `prefix.length` bytes as
 `prefix_sha1` (`length` 0 and `prefix_sha1` `null` if the target does not exist
-or is empty). The server never rotates. The agent compares `prefix_sha1` with the
+or is empty; `prefix_sha1` is also `null` when `prefix.length` is 0). The server never rotates. The agent compares `prefix_sha1` with the
 inode it intends to stream and decides what to do (resume, or seal a stale
 target aside first). A handshake without a valid `target` is rejected.
 
-The handshake does not create the target. The server creates it on the first
-`data` frame, which must then have `offset` 0.
+The handshake creates the destination directory if needed, but not the target
+itself. The server creates the target on the first `data` frame, which must
+then have `offset` 0.
 
 Data
 ----
@@ -85,11 +88,13 @@ A: {"from": "foo.log.20260101T120000Z", "to": "foo.log.20260101T120000Z.bd0fe0ff
 S: ok\n
 ```
 
-The server resolves the directory from the connection's `hello` header and renames
-within it. The frame carries only `from`/`to` basenames and is **idempotent**: if
-`from` is absent and `to` already exists, the server replies `ok` (this makes
-restart/replay safe). On the rename the server fsyncs the segment file and the
-parent directory so completed segments and their final names are crash-durable.
+The server resolves the directory from the connection's handshake
+(`logline-agent-v1`) and renames within it. The frame carries only `from`/`to`
+basenames and is **idempotent**: if `from` is absent and `to` already exists,
+the server replies `ok`, so repeating a rename is harmless. On the rename the
+server fsyncs the renamed file (when it is the connection's own open target,
+which is how the agent uses it) and the parent directory, so completed segments
+and their final names are crash-durable.
 
 Rotation naming
 ---------------
