@@ -207,7 +207,8 @@ class Segment:
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply
         server_length = reply['length']
-        # Resume detection compares only the first ``prefix_length_bytes`` (~50).
+        # Resume detection compares only the first ``prefix_length_bytes`` (~50),
+        # or fewer when the remote copy is shorter than that.
         # It is weakest for repetitive sources whose segments share an identical
         # prefix across rotations (e.g. health-check spam in Docker json logs):
         # two distinct inodes can then look like the same file and be resumed

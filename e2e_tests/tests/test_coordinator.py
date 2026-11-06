@@ -360,6 +360,32 @@ def test_resume_onto_remote_shorter_than_prefix(tmp_path):
     run(tmp_path, scenario)
 
 
+def test_short_stale_remote_with_different_content_is_sealed(tmp_path):
+    # Negative control for the test above: a remote shorter than the prefix that
+    # is NOT the start of our file must still be sealed aside, even though the
+    # local file is longer (so the length check alone does not catch it).
+    stale = b'old segment\n'
+    current = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(stale)
+        foo = src / 'foo.log'
+        foo.write_bytes(current)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == stale
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == current)
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
 def test_no_write_before_seal_recovery(tmp_path):
     async def scenario(src, dst, conf):
         # server already holds a different (older) file under the live target
