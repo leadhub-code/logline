@@ -34,7 +34,7 @@ def make_agent_conf(port):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
-        prefix_length_bytes=50, min_prefix_length_bytes=20,
+        prefix_length_bytes=50,
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
@@ -328,6 +328,32 @@ def test_empty_prefix_then_growth_during_handshake(tmp_path):
             await wait_until(lambda: (d / 'foo.log').read_bytes() == new)
             orphans = [p for p in d.iterdir() if p.name.endswith('.orphan')]
             assert [o.read_bytes() for o in orphans] == [old]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_resume_onto_remote_shorter_than_prefix(tmp_path):
+    # The server holds a correct copy of our inode that is shorter than the
+    # agent's 50-byte prefix (the log was short when the agent stopped), and the
+    # file grew while the agent was down. The server can only hash the bytes it
+    # has, so the agent must compare just that much of its prefix and resume,
+    # instead of sealing the correct copy aside and re-sending it.
+    short = b'service started\n'
+    more = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(short)
+        foo = src / 'foo.log'
+        foo.write_bytes(short + more)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == short + more)
+            await asyncio.sleep(0.1)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
         finally:
             await cancel(task)
 

@@ -217,9 +217,12 @@ class Segment:
         # different file, or this one truncated in place). This also covers an
         # empty new inode: its empty prefix makes the server report
         # `prefix_sha1` null, which is never treated as a match.
+        # The server hashes at most `server_length` bytes of the prefix we sent,
+        # so compare only that much: a correct copy shorter than the prefix (a log
+        # that was still short when the agent stopped) must not look different.
         if (self.role_live and server_length > 0
                 and (server_length > local_length
-                     or reply.get('prefix_sha1') != sha1_b64(prefix))):
+                     or reply.get('prefix_sha1') != sha1_b64(prefix[:server_length]))):
             await self._seal_stale_remote(prefix, server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 
