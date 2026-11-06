@@ -36,7 +36,7 @@ Features
 
 - **Live tailing** – new lines show up on the server within about a second.
 - **Rotation-aware** – follows files across rotations and keeps the rotated
-  segments on the server; optional [marker files](#rotation-markers) let a
+  segments on the server; optional [rotation markers](#rotation-markers) let a
   rotation tool choose their names, and self-rotating sources such as Docker's
   `json-file` driver are handled too.
 - **Resumable** – after a reconnect or restart the agent continues from the
@@ -266,9 +266,9 @@ sequenceDiagram
     A->>S: old connection: drain the rest of the old inode,<br/>close it after 10 minutes without growth
 ```
 
-Before sealing, the agent waits about 10 seconds for an optional
-[rotation marker](#rotation-markers), so the new file starts streaming with
-that delay. `<iso_dt>` is the agent's UTC time when it seals the segment
+Before sealing, the agent waits up to about 10 seconds for an optional
+[rotation marker](#rotation-markers); without one, the new file starts
+streaming with that delay. `<iso_dt>` is the agent's UTC time when it seals the segment
 (`YYYYMMDDTHHMMSSZ`). The wire format and the naming rules are described in
 detail in [Protocol.md](Protocol.md).
 
@@ -282,16 +282,25 @@ mirror uses the same names as the tool's archive:
 
 | File name | Effect |
 | --- | --- |
-| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. The simplest way is to move the log aside under exactly this name; the agent waits about 10 seconds for it after it notices the rotation. |
-| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these names appears, the agent keeps draining the old file, so a tool that produces the first name must eventually produce one of these too. |
+| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. The agent waits up to about 10 seconds for it after it notices the rotation. |
+| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. It must use the same `<iso_dt>`. Until such a name appears, the agent keeps draining the old file, so a tool that produces the first name must eventually produce one of these too. |
 
 `<iso_dt>` must be exactly `YYYYMMDDTHHMMSSZ`, including seconds (e.g.
-`20261106T225900Z`); a name in any other format is ignored and the rotation
-falls back to an `.orphan` name. `<sha13>` is 13 lowercase hex digits. The names
-come from lh-logrotate, an internal rotation tool that is not publicly
-available, which moves the log aside as `foo.log.<iso_dt>.lh-logrotate-waiting`;
-any rotation tool or script can use the same names. Without them everything
-still works; the rotated segments just keep their `.orphan` names.
+`20261106T225900Z`), and `<sha13>` is 13 lowercase hex digits. Names in any
+other format are ignored: a malformed first name makes the rotation fall back
+to an `.orphan` name, a malformed second name leaves the segment draining under
+`foo.log.<iso_dt>`.
+
+The names come from lh-logrotate, an internal rotation tool that is not
+publicly available, which moves the log aside as
+`foo.log.<iso_dt>.lh-logrotate-waiting`; any rotation tool or script can use
+the same names. Without them everything still works; the rotated segments just
+keep their `.orphan` names.
+
+The agent tails every file its `scan` globs match, so keep them from matching
+these names: use patterns like `/var/log/*.log` rather than `/var/log/*`, or
+add an `exclude` such as `/var/log/*.lh-logrotate-*`. Otherwise the renamed log
+would be shipped a second time as a separate file.
 
 Ephemeral log sources
 ---------------------
