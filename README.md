@@ -221,7 +221,7 @@ Configure it on the **agent** via one of (checked in this order):
 - `client_token_file` in the agent's config file (path relative to the config file)
 
 The **server** never stores the raw token, only its SHA-1 hex digest. Compute
-it from a file holding the token (surrounding whitespace is ignored, just like
+it from the file holding the token, here `client-token` (surrounding whitespace is ignored, just like
 the agent does when it reads a token file):
 
 ```bash
