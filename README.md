@@ -222,7 +222,7 @@ Configure it on the **agent** via one of (checked in this order):
 
 The **server** never stores the raw token, only its SHA-1 hex digest. Compute
 it from a file holding the token (surrounding whitespace is ignored, just like
-the agent does):
+the agent does when it reads a token file):
 
 ```bash
 python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_text().strip().encode()).hexdigest())' client-token
