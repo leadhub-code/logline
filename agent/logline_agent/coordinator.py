@@ -83,6 +83,7 @@ class Segment:
         self.ephemeral = ephemeral
 
         self.conn = None
+        self._handshake_prefix = b''    # prefix sent in the latest handshake
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
@@ -199,6 +200,7 @@ class Segment:
 
     async def _connect(self):
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         self.conn = await self.server(
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply

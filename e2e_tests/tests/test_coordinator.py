@@ -13,6 +13,7 @@ from socket import getfqdn
 from time import monotonic
 from types import SimpleNamespace
 
+from logline_agent import coordinator as coordinator_module
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
 import logline_server.main as server_main
@@ -329,6 +330,9 @@ def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode)
 
     monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
     monkeypatch.setattr(server_main, 'record_protocol_error', protocol_errors.append)
+    # A backoff this long would time the test out, so it fails if the first
+    # retry is delayed by the backoff.
+    monkeypatch.setattr(coordinator_module, 'RECONNECT_BACKOFF_MIN_SECONDS', 30)
 
     async def scenario(src, dst, conf):
         foo = src / 'foo.log'
@@ -341,7 +345,7 @@ def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode)
 
             final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
             # a single failure is retried right away, without waiting for a backoff
-            await wait_until(lambda: final.exists(), timeout=0.8)
+            await wait_until(lambda: final.exists())
             assert failed, 'the simulated failure was not triggered'
             assert final.read_bytes() == LINE_ONE
             await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
@@ -414,7 +418,7 @@ def test_failed_rename_of_unsent_segment_does_not_append_to_foreign_file(tmp_pat
         foreign_path = d / 'foo.log.{}'.format(ISO)
         foreign_path.write_bytes(foreign)
         try:
-            await asyncio.sleep(0.1)
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
             old = rotate_aside(src, 'foo.log', ISO)
             (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
             foo.write_bytes(LINE_TWO)
