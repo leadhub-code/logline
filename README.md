@@ -76,7 +76,7 @@ openssl rand -hex 32 > client-token
 ```
 
 ```bash
-tr -d '[:space:]' < client-token | sha1sum
+python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_text().strip().encode()).hexdigest())' client-token
 ```
 
 Run the server on the central machine (the destination directory must already
@@ -221,10 +221,11 @@ Configure it on the **agent** via one of (checked in this order):
 - `client_token_file` in the agent's config file (path relative to the config file)
 
 The **server** never stores the raw token, only its SHA-1 hex digest. Compute
-it with:
+it from a file holding the token (surrounding whitespace is ignored, just like
+the agent does):
 
-```
-printf '%s' 'your-secret-token' | sha1sum
+```bash
+python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_text().strip().encode()).hexdigest())' client-token
 ```
 
 and configure it via `client_token_hashes` (a list) in the server's config
