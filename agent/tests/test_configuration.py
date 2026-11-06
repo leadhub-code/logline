@@ -39,3 +39,15 @@ def test_log_file_level_is_case_insensitive(temp_dir):
 def test_log_file_level_rejects_unknown_level(temp_dir):
     with pytest.raises(ConfigurationError):
         load_conf(temp_dir, BASE_CONF + 'log:\n  level: trace\n')
+
+
+@pytest.mark.parametrize('content', ['', '# everything is commented out\n'], ids=['empty', 'comments-only'])
+def test_empty_config_file(temp_dir, monkeypatch, content):
+    # YAML loads an empty or comments-only document as None; the CLI options
+    # and the environment still have to be enough to configure the agent.
+    monkeypatch.setenv('CLIENT_TOKEN', 'topsecret')
+    cfg_path = temp_dir / 'configuration.yaml'
+    cfg_path.write_text(content)
+    args = get_argument_parser().parse_args(['--conf', str(cfg_path), '--server', '127.0.0.1:9999', '--scan', '/var/log/*.log'])
+    conf = Configuration(args=args)
+    assert conf.scan_globs == ['/var/log/*.log']

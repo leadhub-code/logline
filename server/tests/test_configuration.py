@@ -81,3 +81,13 @@ def test_log_file_level_rejects_unknown_level(tmp_path):
     cfg_path = write_conf_with_log_level(tmp_path, 'trace')
     with pytest.raises(ConfigurationError):
         Configuration(args=make_args(conf=str(cfg_path)))
+
+
+@pytest.mark.parametrize('content', ['', '# everything is commented out\n'], ids=['empty', 'comments-only'])
+def test_empty_config_file(tmp_path, content):
+    # YAML loads an empty or comments-only document as None; the CLI options
+    # from make_args() still have to be enough to configure the server.
+    cfg_path = tmp_path / 'conf.yaml'
+    cfg_path.write_text(content)
+    conf = Configuration(args=make_args(conf=str(cfg_path)))
+    assert conf.client_token_hashes == {'dummyhash'}
