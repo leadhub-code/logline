@@ -76,7 +76,7 @@ openssl rand -hex 32 > client-token
 ```
 
 ```bash
-python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_text().strip().encode()).hexdigest())' client-token
+python3 -c 'from hashlib import sha1; print(sha1(open("client-token", "rb").read().strip()).hexdigest())'
 ```
 
 Run the server on the central machine (the destination directory must already
@@ -225,7 +225,7 @@ it from a file holding the token (surrounding whitespace is ignored, just like
 the agent does when it reads a token file):
 
 ```bash
-python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_text().strip().encode()).hexdigest())' client-token
+python3 -c 'from hashlib import sha1; print(sha1(open("client-token", "rb").read().strip()).hexdigest())'
 ```
 
 and configure it via `client_token_hashes` (a list) in the server's config
