@@ -274,21 +274,24 @@ detail in [Protocol.md](Protocol.md).
 
 ### Rotation markers
 
-A rotation tool can control the names of the rotated segments by creating empty
-marker files next to the log. The agent then copies the timestamp and the hash
-from the markers instead of inventing its own, so the mirror uses the same
-names as the tool's archive:
+A rotation tool can control the names of the rotated segments through the file
+names it uses. The agent watches the names of the files in the log's directory
+(it never reads their contents). When it finds one of the names below, it
+copies the timestamp and the hash from it instead of inventing its own, so the
+mirror uses the same names as the tool's archive:
 
-| Marker file | Effect |
+| File name | Effect |
 | --- | --- |
-| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. Create it when the log is moved aside; the agent waits about 10 seconds for it after it notices the rotation. |
-| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these appears, the agent keeps draining the old file, so a tool that creates the waiting marker must eventually create one of these too. |
+| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. The simplest way is to move the log aside under exactly this name; the agent waits about 10 seconds for it after it notices the rotation. |
+| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these names appears, the agent keeps draining the old file, so a tool that produces the first name must eventually produce one of these too. |
 
-`<iso_dt>` uses the `YYYYMMDDTHHMMSSZ` format and `<sha13>` is 13 lowercase hex
-digits. The marker names come from lh-logrotate, an internal rotation tool that
-is not publicly available, but any rotation tool or script can create them.
-Without markers everything still works; the rotated segments just keep their
-`.orphan` names.
+`<iso_dt>` must be exactly `YYYYMMDDTHHMMSSZ`, including seconds (e.g.
+`20261106T225900Z`); a name in any other format is ignored and the rotation
+falls back to an `.orphan` name. `<sha13>` is 13 lowercase hex digits. The names
+come from lh-logrotate, an internal rotation tool that is not publicly
+available, which moves the log aside as `foo.log.<iso_dt>.lh-logrotate-waiting`;
+any rotation tool or script can use the same names. Without them everything
+still works; the rotated segments just keep their `.orphan` names.
 
 Ephemeral log sources
 ---------------------
