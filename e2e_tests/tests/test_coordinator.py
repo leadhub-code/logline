@@ -294,42 +294,93 @@ def test_no_write_before_seal_recovery(tmp_path):
     run(tmp_path, scenario)
 
 
+# Lines longer than the agent's 50-byte prefix, so a wrong read position after
+# a reconnect would show up as an offset mismatch on the server.
+LINE_ONE = b'2026-01-01 12:00:00 line one, long enough to exceed the agent prefix length\n'
+LINE_TWO = b'2026-01-01 12:05:00 line two, long enough to exceed the agent prefix length\n'
+
+
+def rotate_with_markers(src):
+    rotate_aside(src, 'foo.log', ISO)
+    (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+    (src / 'foo.log').write_bytes(LINE_TWO)
+    (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+
+
 @pytest.mark.parametrize('failing_rename', ['seal', 'finalize'])
-def test_rename_dropped_by_server_is_retried(tmp_path, monkeypatch, failing_rename):
-    # The server drops the connection after receiving a rename frame but before
-    # applying it (e.g. it is restarting). The agent must notice that the rename
-    # did not happen and retry it, instead of assuming it was applied.
+@pytest.mark.parametrize('mode', ['dropped', 'reply-lost'])
+def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode):
+    # The connection fails around a rename frame: either before the server
+    # applies it (e.g. the server is restarting), or after it applied it but
+    # before the reply reached the agent. The agent must find out which one
+    # happened and end up with the rename applied exactly once.
     fail_to = 'foo.log.{}'.format(ISO) if failing_rename == 'seal' else 'foo.log.{}.{}'.format(ISO, SHA13)
     original_handle_rename = server_main.handle_rename
-    dropped = []
+    failed = []
+    protocol_errors = []
 
     def flaky_handle_rename(dst_dir, current_path, f, metadata):
-        if metadata.get('to') == fail_to and not dropped:
-            dropped.append(metadata)
-            raise ConnectionResetError('simulated connection drop before the rename')
+        if metadata.get('to') == fail_to and not failed:
+            failed.append(metadata)
+            if mode == 'reply-lost':
+                original_handle_rename(dst_dir, current_path, f, metadata)
+            raise ConnectionResetError('simulated connection drop around the rename')
         return original_handle_rename(dst_dir, current_path, f, metadata)
 
     monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    monkeypatch.setattr(server_main, 'record_protocol_error', protocol_errors.append)
 
     async def scenario(src, dst, conf):
         foo = src / 'foo.log'
-        foo.write_bytes(b'2026-01-01 12:00:00 line one\n')
+        foo.write_bytes(LINE_ONE)
         coord, task = start_coordinator(conf, foo)
         d = dst_dir_for(dst, src)
         try:
-            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:00:00 line one\n')
-            rotate_aside(src, 'foo.log', ISO)
-            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
-            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
-            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
 
             final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
             await wait_until(lambda: final.exists())
-            assert dropped, 'the simulated failure was not triggered'
-            assert final.read_bytes() == b'2026-01-01 12:00:00 line one\n'
-            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+            assert failed, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
             # no leftover sealed segment and no duplicate copy sealed aside as an orphan
             assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+            # the agent resumed at the right offset after reconnecting
+            assert protocol_errors == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_persistently_failing_rename_backs_off(tmp_path, monkeypatch):
+    # A rename the server can never apply (e.g. a permission problem in the
+    # destination directory) must not be retried in a tight loop.
+    attempts = []
+
+    def failing_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == 'foo.log.{}.{}'.format(ISO, SHA13):
+            attempts.append(metadata)
+            raise PermissionError('simulated permanent rename failure')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    original_handle_rename = server_main.handle_rename
+    monkeypatch.setattr(server_main, 'handle_rename', failing_handle_rename)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
+            await wait_until(lambda: bool(attempts))
+            await asyncio.sleep(2)
+            assert len(attempts) <= 5
+            # the live segment is unaffected
+            assert (d / 'foo.log').read_bytes() == LINE_TWO
         finally:
             await cancel(task)
 

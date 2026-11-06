@@ -146,8 +146,9 @@ class Segment:
         # for an ephemeral orphan the destination is the shared fixed
         # `<basename>.orphan`, which a later rotation may already have clobbered
         # with a newer segment. The generic `_rename` retry reconnects to the
-        # destination and treats "it exists" as success -- unsafe here, since we
-        # could adopt (and resume onto) that newer file. So we fail closed.
+        # destination and treats "it holds the start of our file" as success --
+        # unsafe here, since a newer orphan of a repetitive source can start with
+        # the same bytes, and we could adopt (and resume onto) it. So we fail closed.
         await self._rename(self.target, seal_name, fail_closed=self.ephemeral and is_orphan)
         logger.info('Sealed %s as %s', self.file_path, seal_name)
         self.target = seal_name
@@ -289,6 +290,7 @@ class Segment:
             self._lag = self._stream_lag()
 
     async def _rename(self, src, dst, fail_closed=False):
+        backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
             try:
                 await self.conn.send_rename(src, dst)
@@ -309,22 +311,39 @@ class Segment:
                 # The failure does not tell whether the server applied the rename.
                 # Ask it: reconnect targeting the destination; if that holds our
                 # data, the rename is done.
-                self.target = dst
-                await self._reconnect()
-                if self.conn.header_reply['length'] > 0:
+                if await self._reconnect_to(dst) and self._remote_is_ours():
                     return
                 # Not applied. Reconnect targeting the source and retry the rename
                 # on that connection (the server's rename is idempotent).
-                self.target = src
-                await self._reconnect()
-                if self.conn.header_reply['length'] == 0:
+                if not await self._reconnect_to(src):
                     # Neither name holds any data: nothing was ever sent, so there
                     # is nothing to rename. Continue under the destination name.
                     logger.info('rename %s -> %s on %s: nothing to rename on the server',
                                 src, dst, self.file_path)
-                    self.target = dst
-                    await self._reconnect()
+                    await self._reconnect_to(dst)
                     return
+                # Back off before retrying, so a rename the server keeps failing
+                # (e.g. a permission problem) is not retried in a tight loop.
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
+
+    async def _reconnect_to(self, target):
+        '''
+        Reconnect with ``target`` as this segment's target and continue reading
+        where the server's copy ends. Return the server's length of ``target``.
+        '''
+        self.target = target
+        await self._reconnect()
+        length = self.conn.header_reply['length']
+        self.file_stream.seek(length)
+        return length
+
+    def _remote_is_ours(self):
+        '''Whether the target the server just reported holds the start of our inode.'''
+        reply = self.conn.header_reply
+        prefix = self._read_prefix()[:reply['length']]
+        self.file_stream.seek(reply['length'])
+        return reply.get('prefix_sha1') == sha1_b64(prefix)
 
     def _read_prefix(self):
         self.file_stream.seek(0)
