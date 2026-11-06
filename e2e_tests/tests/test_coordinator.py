@@ -13,12 +13,11 @@ from socket import getfqdn
 from time import monotonic
 from types import SimpleNamespace
 
-import pytest
-
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
 import logline_server.main as server_main
 from logline_server.main import handle_client, sha1_hex
+import pytest
 
 
 CLIENT_TOKEN = 'topsecret'
