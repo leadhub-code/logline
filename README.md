@@ -8,12 +8,16 @@ Logline
 
 Live synchronization of log files from multiple computers (usually VMs, servers…) to a single place.
 
-(Log file = a regular file that only grows (new content is only appended) and can be rotated.)
+A log file here means a regular file that only grows (new content is appended
+to it) and may be rotated.
 
-Logline consists of two pieces:
+Logline has two components:
 
-- **agent** reads the logs and sends their content to the server via (encrypted) TCP connection
-- **server** listens on a TCP port, receives data from agents and manages a mirror of the log files processed by agents
+- **agent** runs on every machine whose logs you want to collect. It follows the
+  log files and sends new content to the server over a TCP connection,
+  optionally encrypted with TLS.
+- **server** runs on the central machine. It receives the data from all agents
+  and keeps a mirror of their log files in a directory.
 
 ```mermaid
 flowchart LR
@@ -140,8 +144,9 @@ Both programs accept command-line options (see `--help`) and a YAML config file
 passed via `--conf` (the server also reads the `CONF_FILE` environment
 variable). Relative file paths in a config file (`dest`, `log.file`, TLS files,
 `client_token_file`) are resolved relative to the config file itself; the glob
-patterns in `scan`, `exclude` and `ephemeral` are not, so make them absolute. Single-value command-line options take precedence over the config
-file; list options (`--scan`, `--client-token-hash`) are merged with it.
+patterns in `scan`, `exclude` and `ephemeral` are not, so make them absolute.
+Single-value command-line options take precedence over the config file; list
+options (`--scan`, `--client-token-hash`) are merged with it.
 
 ### Agent
 
@@ -235,9 +240,9 @@ individually. If a connecting agent's token doesn't match, the server logs
 the hash it computed for the rejected token, which is convenient when
 provisioning a new agent.
 
-The TCP connection can be encrypted via SSL/TLS – using a certificate for
-example from LetsEncrypt.org or a self-signed one. Enable it on both sides: the
-server with `tls.cert` + `tls.key`, the agent with `tls.enabled` (and `tls.cert`
+The TCP connection can be encrypted with TLS, using for example a certificate
+from Let's Encrypt or a self-signed one. Enable it on both sides: on the server
+with `tls.cert` and `tls.key`, on the agent with `tls.enabled` (plus `tls.cert`
 when the server's certificate is not trusted by the system).
 
 Rotation
@@ -268,9 +273,9 @@ sequenceDiagram
 
 Before sealing, the agent waits up to about 10 seconds for an optional
 [rotation marker](#rotation-markers); without one, the new file starts
-streaming with that delay. `<iso_dt>` is the agent's UTC time when it seals the segment
-(`YYYYMMDDTHHMMSSZ`). The wire format and the naming rules are described in
-detail in [Protocol.md](Protocol.md).
+streaming with that delay. `<iso_dt>` is the agent's UTC time when it seals the
+segment (`YYYYMMDDTHHMMSSZ`). The wire format and the naming rules are described
+in detail in [Protocol.md](Protocol.md).
 
 ### Rotation markers
 
