@@ -81,18 +81,3 @@ On Linux all sockets sharing a port via `SO_REUSEPORT` must belong to the same
 effective user, which prevents other users from hijacking the port. Be aware,
 though, that any process running as the same user on the host can join the
 listening group.
-
-Version
--------
-
-Both `logline-agent --version` and `logline-server --version` print the
-version and, when known, the git commit they were built from. When running
-from a git checkout, the commit is read from the checkout (with a `-dirty`
-suffix for uncommitted changes). The server container image does not include
-`.git`, so pass the commit at build time:
-
-```
-docker build server --build-arg GIT_COMMIT=$(git rev-parse HEAD)
-```
-
-`make image` does this automatically.
