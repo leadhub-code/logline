@@ -310,6 +310,14 @@ export OpenTelemetry metrics over OTLP/gRPC – to `metrics.endpoint`, the
 `OTEL_SDK_DISABLED=true` turns them off. An importable Grafana dashboard and
 notes on the expected collector setup live in [grafana/](grafana/).
 
+```mermaid
+flowchart LR
+    agents["logline-agent<br/>(every host)"] -- "OTLP/gRPC" --> otel["OpenTelemetry<br/>collector"]
+    server["logline-server"] -- "OTLP/gRPC" --> otel
+    otel --> prometheus[("Prometheus")]
+    prometheus --> grafana["Grafana<br/>dashboard"]
+```
+
 Development
 -----------
 
