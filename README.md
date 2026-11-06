@@ -65,9 +65,8 @@ uv tool install "git+https://github.com/leadhub-code/logline#subdirectory=server
 uv tool install "git+https://github.com/leadhub-code/logline#subdirectory=agent"
 ```
 
-(Append `[otel]` to the package, e.g.
-`"logline-agent[otel] @ git+https://github.com/leadhub-code/logline#subdirectory=agent"`,
-to get the optional metrics support.)
+(For the optional metrics support use the `name[otel] @ url` form, e.g.
+`"logline-agent[otel] @ git+https://github.com/leadhub-code/logline#subdirectory=agent"`.)
 
 Generate a client token and compute its hash for the server (see
 [Authentication](#authentication)):
@@ -80,7 +79,12 @@ openssl rand -hex 32 > client-token
 tr -d '\n' < client-token | sha1sum
 ```
 
-Run the server on the central machine:
+Run the server on the central machine (the destination directory must already
+exist):
+
+```bash
+mkdir -p /srv/logline
+```
 
 ```bash
 logline-server --dest /srv/logline --client-token-hash <sha1-hex-from-above>
@@ -91,6 +95,11 @@ Run the agent on every machine whose logs you want to collect:
 ```bash
 logline-agent --server logs.example.com:5645 --token-file client-token --scan '/var/log/*.log'
 ```
+
+This minimal setup sends the token and the logs in plaintext. For anything
+beyond a trusted network enable TLS: `--tls-cert` and `--tls-key` on the
+server, `--tls` (or `--tls-cert <ca.pem>` for a self-signed certificate) on the
+agent.
 
 The server image can also be built with Docker (it includes the metrics
 support). Its entrypoint is `logline-server`, so options can be passed directly
@@ -108,8 +117,9 @@ How the mirror looks
 --------------------
 
 The server stores every file under `<dest>/<hostname>/<mangled-directory>/`,
-where `<hostname>` is the agent's FQDN and every `/` of the source directory is
-replaced with `~`. For example:
+where `<hostname>` is what `socket.getfqdn()` returns on the agent's machine
+and `<mangled-directory>` is the resolved (symlink-free) source directory with
+every `/` replaced with `~`. For example:
 
 ```
 /srv/logline/                                         ← dest
@@ -128,8 +138,9 @@ Configuration
 
 Both programs accept command-line options (see `--help`) and a YAML config file
 passed via `--conf` (the server also reads the `CONF_FILE` environment
-variable). Relative paths in a config file are resolved relative to the config
-file itself. Single-value command-line options take precedence over the config
+variable). Relative file paths in a config file (`dest`, `log.file`, TLS files,
+`client_token_file`) are resolved relative to the config file itself; the glob
+patterns in `scan`, `exclude` and `ephemeral` are not, so make them absolute. Single-value command-line options take precedence over the config
 file; list options (`--scan`, `--client-token-hash`) are merged with it.
 
 ### Agent
@@ -139,8 +150,8 @@ server: logs.example.com:5645
 
 tls:
   enabled: true
-  # cert: server-ca.pem   # CA bundle or self-signed cert to verify the server with;
-  #                       # without it the system trust store is used
+  # cert: server-ca.pem   # CA bundle or self-signed cert to verify the server with
+  #                       # (also enables TLS); without it the system trust store is used
 
 client_token_file: client-token
 
@@ -173,7 +184,7 @@ metrics:
 ### Server
 
 ```yaml
-bind: 0.0.0.0:5645        # default: all interfaces, port 5645
+bind: :5645               # default: all interfaces, port 5645
 dest: /srv/logline
 
 tls:
@@ -182,7 +193,7 @@ tls:
   # key_password_file: key-password
 
 client_token_hashes:
-  - 3f786850e387550fdab836ed7e6dc881de23001b
+  - <sha1-hex-of-the-client-token>
 
 reuse_port: false         # see "Scaling the server"
 
@@ -337,7 +348,7 @@ make lint    # ruff only
 ```
 
 ```bash
-make image   # build the server Docker image
+make image   # build the server container image (uses podman)
 ```
 
 License
