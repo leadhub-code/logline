@@ -24,6 +24,8 @@ from glob import glob
 from logging import getLogger
 from os import fstat
 from pathlib import Path
+from random import uniform
+from time import monotonic as monotime
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
@@ -42,6 +44,11 @@ RECONNECT_BACKOFF_MIN_SECONDS = 1.0
 RECONNECT_BACKOFF_MAX_SECONDS = 30.0
 
 
+def jittered(seconds):
+    '''Randomize a backoff delay so agents do not reconnect in lockstep after a server outage.'''
+    return seconds * uniform(0.5, 1.5)
+
+
 def utc_iso_dt():
     return datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
@@ -56,6 +63,9 @@ class _EndSegment(Exception):
     no longer unique, and reconnecting would risk resuming onto a *newer* orphan
     (offset taken from the wrong file, stale bytes interleaved). The data of a
     sealed orphan is end-of-life, so we fail closed instead: log and end.
+
+    Also raised when a closing segment's inode is truncated: its sealed target
+    must not receive the truncated inode's new content.
     '''
 
 
@@ -86,8 +96,10 @@ class Segment:
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
+        self._finish_requested = False   # live segment of a deleted path: end once drained
         self.task = None
         self._lag = 0                    # bytes readable but not yet shipped
+        self.last_active = monotime()    # when bytes were last shipped
 
     # -- coordinator-facing API --------------------------------------------
 
@@ -97,6 +109,19 @@ class Segment:
 
     def request_seal(self, seal_name, is_orphan, iso_dt):
         self._pending_seal = (seal_name, is_orphan, iso_dt)
+
+    async def finish(self):
+        '''End a live segment without sealing, once everything readable is shipped.'''
+        self._finish_requested = True
+        if self.task is not None:
+            await self.task
+
+    def is_drained(self):
+        '''True if every byte of the inode has been read (and so shipped).'''
+        try:
+            return fstat(self.file_stream.fileno()).st_size <= self.file_stream.tell()
+        except (OSError, ValueError):
+            return True
 
     async def wait_sealed(self):
         # Resolve when the seal rename is acked, or bail if the segment task died
@@ -113,7 +138,9 @@ class Segment:
         register_lag_source(id(self), lambda: self._lag)
         try:
             await self._connect()
-            await self._live_phase()
+            if await self._live_phase():
+                logger.info('Finished segment %s (target %s)', self.file_path, self.target)
+                return
             await self._do_seal()
             await self._closing_phase()
         except asyncio.CancelledError:
@@ -127,10 +154,13 @@ class Segment:
             self._close()
 
     async def _live_phase(self):
+        '''Stream the live inode until a seal is requested; return True if finished instead.'''
         while self._pending_seal is None:
             sent = await self._drain_available()
             if self._pending_seal is not None:
                 break
+            if self._finish_requested and not sent and self.is_drained():
+                return True
             if self.is_own_log:
                 # do not process our own logfile too often to avoid feedback noise
                 await asyncio.sleep(60)
@@ -173,7 +203,6 @@ class Segment:
 
     async def _drain_until_idle(self):
         '''Orphan completion: drain until no growth for ``seal_idle_seconds``.'''
-        from time import monotonic as monotime
         last_active = monotime()
         while True:
             if await self._drain_available():
@@ -197,9 +226,7 @@ class Segment:
     # -- connection / IO ---------------------------------------------------
 
     async def _connect(self):
-        prefix = self._read_prefix()
-        self.conn = await self.server(
-            log_path=self.file_path, target=self.target, log_prefix=prefix)
+        prefix = await self._open_connection()
         reply = self.conn.header_reply
         server_length = reply['length']
         # Resume detection compares only the first ``prefix_length_bytes`` (~50).
@@ -208,12 +235,31 @@ class Segment:
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
-        if (self.role_live and server_length > 0
-                and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
-            await self._seal_stale_remote(prefix, server_length)
+        if self.role_live and server_length > 0 and not self._is_same_file(prefix, reply):
+            await self._seal_stale_remote(server_length)
         self.file_stream.seek(self.conn.header_reply['length'])
 
-    async def _seal_stale_remote(self, prefix, server_length):
+    def _is_same_file(self, prefix, reply):
+        '''
+        Decide whether a non-empty server target mirrors the inode we stream.
+
+        Both sides must hash the same bytes: the server hashes the first
+        ``min(server_length, len(prefix))`` bytes of the target and reports that
+        count as ``prefix_length`` (older servers hash the same span without
+        reporting it, so we derive it). Nothing hashed (our prefix was empty)
+        is never a match, and neither is a local file shorter than the target:
+        resuming would seek past our EOF and append our later bytes to someone
+        else's content.
+        '''
+        server_length = reply['length']
+        hashed_length = reply.get('prefix_length', min(server_length, len(prefix)))
+        if hashed_length <= 0 or hashed_length > len(prefix):
+            return False
+        if reply.get('prefix_sha1') != sha1_b64(prefix[:hashed_length]):
+            return False
+        return fstat(self.file_stream.fileno()).st_size >= server_length
+
+    async def _seal_stale_remote(self, server_length):
         '''
         Recovery: the live target already holds a different, completed segment
         (e.g. a rotation we missed across a crash). We must not append to it.
@@ -232,8 +278,7 @@ class Segment:
         # file; we drop it and reconnect fresh to the original target.
         await self.conn.send_rename(self.target, seal_name)
         self.conn.close()
-        self.conn = await self.server(
-            log_path=self.file_path, target=self.target, log_prefix=prefix)
+        await self._open_connection()
 
     async def _reconnect(self):
         try:
@@ -242,22 +287,35 @@ class Segment:
         except Exception:
             pass
         self.conn = None
-        prefix = self._read_prefix()
+        await self._open_connection()
+
+    async def _open_connection(self):
+        '''
+        Connect ``self.conn`` to ``self.target`` and return the prefix sent.
+
+        Failures (refused connection, failed handshake) are retried with a capped,
+        jittered exponential backoff instead of propagating and ending the
+        segment task: a paused file resumes once the server is back, and an
+        unreachable server is not hammered by a respawn on every coordinator tick.
+        '''
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
+            # Reading the prefix moves the read position; keep it, since callers
+            # such as the rename retry continue from where they were.
+            pos = self.file_stream.tell()
+            prefix = self._read_prefix()
+            self.file_stream.seek(pos)
             try:
                 self.conn = await self.server(
                     log_path=self.file_path, target=self.target, log_prefix=prefix)
-                return
+                return prefix
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # Keep retrying instead of letting the failure propagate and
-                # end the segment task: a paused file resumes once the server
-                # is back, an orphaned one stays frozen until the next rotation.
-                logger.warning('Reconnect for %s (target %s) failed: %r; retrying in %.1fs',
-                               self.file_path, self.target, e, backoff)
-                await asyncio.sleep(backoff)
+                delay = jittered(backoff)
+                logger.warning('Connecting %s (target %s) failed: %r; retrying in %.1fs',
+                               self.file_path, self.target, e, delay)
+                await asyncio.sleep(delay)
                 backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
 
     async def _drain_available(self):
@@ -265,6 +323,10 @@ class Segment:
         sent_any = False
         while True:
             pos = self.file_stream.tell()
+            size = fstat(self.file_stream.fileno()).st_size
+            if size < pos:
+                await self._on_truncated(pos, size)
+                continue
             chunk = self.file_stream.read(CHUNK_SIZE)
             if not chunk:
                 self._lag = 0
@@ -286,33 +348,69 @@ class Segment:
             # re-reads these bytes, so counting post-send avoids double-counting.
             record_bytes_read(len(chunk))
             sent_any = True
+            self.last_active = monotime()
             self._lag = self._stream_lag()
 
+    async def _on_truncated(self, pos, size):
+        '''
+        The inode shrank below our read offset (copytruncate or a plain
+        truncation). Treat it as a markerless rotation of the same inode: the
+        target holds the previous generation, so seal it aside and stream the
+        inode again from offset 0 into a fresh target. Without this the segment
+        would stall at EOF and later append post-offset bytes to the old mirror.
+        '''
+        logger.warning('%s was truncated (size %d < shipped offset %d); target %s',
+                       self.file_path, size, pos, self.target)
+        record_rotation()
+        if not self.role_live:
+            # A closing segment's target is a sealed name; the truncated inode's
+            # new content does not belong there, so stop shipping it.
+            logger.warning('Ending closing segment %s (target %s) after truncation', self.file_path, self.target)
+            raise _EndSegment()
+        await self._seal_stale_remote(pos)
+        self.file_stream.seek(self.conn.header_reply['length'])
+
     async def _rename(self, src, dst, fail_closed=False):
+        if not fail_closed and self.file_stream.tell() == 0:
+            # Nothing was ever shipped to `src`, and the server creates targets
+            # lazily on the first append, so there is nothing to rename (the
+            # server would reject a rename where neither name exists). Just bind
+            # the connection to `dst`, where any later bytes belong.
+            self.target = dst
+            await self._reconnect()
+            return
+        backoff = RECONNECT_BACKOFF_MIN_SECONDS
+        retried = False
         while True:
             try:
                 await self.conn.send_rename(src, dst)
-                return
+                break
             except Exception as e:
                 if fail_closed:
-                    # The reconnect-to-destination recovery below assumes `dst` is
-                    # unique to this segment. A fixed `<basename>.orphan` is not:
-                    # `dst` existing may be a *newer* rotation's orphan, not our
-                    # rename applied. Adopting it would resume onto the wrong file,
-                    # so give up and end the segment instead.
+                    # The retry below relies on `dst` being unique to this
+                    # segment. A fixed `<basename>.orphan` is not: `dst` existing
+                    # may be a *newer* rotation's orphan, not our rename applied.
+                    # Adopting it would resume onto the wrong file, so give up and
+                    # end the segment instead.
                     logger.warning('seal rename %s -> %s on %s failed: %r; ending segment '
                                    '(fixed orphan name is unsafe to resume onto)',
                                    src, dst, self.file_path, e)
                     raise _EndSegment() from e
-                logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
-                               src, dst, self.file_path, e)
-                # Reconnect targeting the destination: the rename may already be
-                # applied server-side (it is idempotent), or still pending.
-                self.target = dst
+                delay = jittered(backoff)
+                logger.warning('rename %s -> %s on %s failed: %r; reconnecting and retrying in %.1fs',
+                               src, dst, self.file_path, e, delay)
+                # We cannot tell whether the server applied the rename before the
+                # failure, so resend it on a fresh connection: the frame is
+                # idempotent (`from` absent and `to` present is a no-op `ok`).
+                retried = True
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX_SECONDS)
                 await self._reconnect()
-                if self.conn.header_reply['length'] >= 0:
-                    # server now holds `dst`; the rename is effectively done
-                    return
+        self.target = dst
+        if retried:
+            # The retry connection was opened on `src`. If the rename had already
+            # been applied, that connection holds no file, so rebind it to `dst`.
+            await self._reconnect()
 
     def _read_prefix(self):
         self.file_stream.seek(0)
@@ -357,6 +455,7 @@ class PathCoordinator:
         self.closing = set()
         self.consumed_isos = set()
         self.last_inode = None
+        self.missing_since = None   # when the path was first seen missing
 
     async def run(self):
         marker_task = create_task(self.markers.run())
@@ -373,9 +472,15 @@ class PathCoordinator:
                     self.live = None
                     self.last_inode = None
                 inode = self._stat_inode()
-                if inode is not None and inode != self.last_inode:
-                    await self._on_new_inode(inode)
-                    self.last_inode = inode
+                if inode is None:
+                    if await self._on_missing_path():
+                        logger.info('%s no longer exists and everything was shipped; stopping', self.file_path)
+                        return
+                else:
+                    self.missing_since = None
+                    if inode != self.last_inode:
+                        await self._on_new_inode(inode)
+                        self.last_inode = inode
                 await asyncio.sleep(self.conf.tail_read_interval_seconds)
         finally:
             marker_task.cancel()
@@ -399,6 +504,38 @@ class PathCoordinator:
             await self._seal_live()
         self.live = self._make_segment(f, f_inode, target=self.basename, role_live=True)
         self.live.start()
+
+    async def _on_missing_path(self):
+        '''
+        The tailed path does not exist. Return True once nothing is left to do
+        for it, so the coordinator ends and the path leaves the watched set.
+
+        The live segment keeps draining the deleted inode (a producer may still
+        write to it) until the path has been missing, and the inode fully shipped
+        without growth, for ``deleted_path_idle_seconds``. Then, if lh-logrotate
+        left a ``.waiting`` marker (it rotated the file away and nothing recreated
+        it), the marker-based seal is completed as on a normal rotation; otherwise
+        the live segment just ends, closing its fd and connection. Closing
+        segments are left to finish on their own.
+        '''
+        now = monotime()
+        if self.missing_since is None:
+            self.missing_since = now
+        if self.live is not None:
+            timeout = self.conf.deleted_path_idle_seconds
+            if (now - self.missing_since < timeout or now - self.live.last_active < timeout
+                    or not self.live.is_drained()):
+                return False
+            if self.markers.newest_unconsumed_waiting(self.consumed_isos) is not None:
+                logger.info('%s was rotated away and not recreated; sealing the live segment', self.file_path)
+                await self._seal_live()
+            else:
+                logger.info('%s is gone and its inode is idle; finishing the live segment', self.file_path)
+                await self.live.finish()
+                self.live = None
+            self.last_inode = None
+            return False
+        return not self.closing
 
     async def _seal_live(self):
         '''Seal the current live segment and move it to the closing set.'''

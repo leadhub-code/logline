@@ -1,5 +1,6 @@
 from asyncio import IncompleteReadError, run
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from logline_server.main import handle_client, sha1_b64, sha1_hex
@@ -184,3 +185,26 @@ def test_boolean_offset_is_rejected(tmp_path):
     # (bool is not accepted even though False == 0), so no file appears.
     assert writer.buffer.count(b'ok') == 1
     assert not dst_file(tmp_path).exists()
+
+
+def test_destination_directory_created_concurrently(tmp_path, monkeypatch):
+    # Another server process (--reuse-port) creates the destination directories
+    # between our existence check and our mkdir: that must not fail the handshake.
+    dst_dir = dst_file(tmp_path).parent
+    dst_dir.mkdir(parents=True)
+    real_is_dir = Path.is_dir
+    calls = []
+
+    def stale_is_dir(self):
+        # Only the server's own pre-check sees the stale "missing" answer.
+        calls.append(self)
+        return False if len(calls) == 1 else real_is_dir(self)
+    monkeypatch.setattr(Path, 'is_dir', stale_is_dir)
+    conf = make_conf(tmp_path)
+    writer = drive(
+        conf,
+        frame('logline-agent-v1', valid_header()),
+        frame('data', {'offset': 0, 'compression': None}, b'log line\n'),
+    )
+    assert writer.buffer.count(b'ok') == 2
+    assert dst_file(tmp_path).read_bytes() == b'log line\n'

@@ -10,6 +10,7 @@ import json
 from logging import getLogger
 from pathlib import Path
 import re
+import socket
 from socket import getfqdn
 from ssl import Purpose, create_default_context
 from time import monotonic as monotime
@@ -19,7 +20,13 @@ from .telemetry import record_bytes_sent, record_connect, record_frame, record_s
 
 logger = getLogger(__name__)
 
-socket_timeout = 300
+# TCP keepalive tuning (Linux): probe an idle connection after 30 s, then every
+# 10 s, and drop it after 3 unanswered probes. A half-open connection (the
+# server host vanished without a FIN/RST) is then detected within about a
+# minute instead of the kernel's default of over two hours.
+KEEPALIVE_IDLE_SECONDS = 30
+KEEPALIVE_INTERVAL_SECONDS = 10
+KEEPALIVE_COUNT = 3
 
 # Establishing the TCP/TLS connection should be quick; without a timeout a
 # silent or unreachable server would make open_connection() hang indefinitely.
@@ -56,7 +63,8 @@ async def connect_to_server(conf, log_path, target, log_prefix):
     except Exception:
         record_connect('error')
         raise
-    cc = ClientConnection(reader, writer)
+    enable_keepalive(writer.get_extra_info('socket'))
+    cc = ClientConnection(reader, writer, reply_timeout=conf.reply_timeout_seconds)
     await cc.send_header({
         'hostname': getfqdn(),
         'directory': str(Path(log_path).parent),
@@ -79,9 +87,10 @@ class ClientConnection:
     Use connect_to_server() to create instance of this class.
     '''
 
-    def __init__(self, reader, writer):
+    def __init__(self, reader, writer, reply_timeout):
         self.reader = reader
         self.writer = writer
+        self.reply_timeout = reply_timeout
         self.header_reply = None
 
     def close(self):
@@ -133,8 +142,8 @@ class ClientConnection:
             self.writer.write('{} {} {}\n'.format(command, len(md_bytes), len(data)).encode('ascii'))
             self.writer.write(md_bytes)
             self.writer.write(data)
-        await wait_for(self.writer.drain(), timeout=socket_timeout)
-        reply_line = await wait_for(self.reader.readline(), timeout=socket_timeout)
+        await wait_for(self.writer.drain(), timeout=self.reply_timeout)
+        reply_line = await wait_for(self.reader.readline(), timeout=self.reply_timeout)
         #logger.debug('Received reply line %r', reply_line)
         if not reply_line:
             # EOF: the server closed the connection before sending a reply line
@@ -154,7 +163,7 @@ class ClientConnection:
         else:
             raise ClientError('Malformed reply line: {!r}'.format(reply_line))
         if reply_length:
-            reply_json = await wait_for(self.reader.readexactly(reply_length), timeout=socket_timeout)
+            reply_json = await wait_for(self.reader.readexactly(reply_length), timeout=self.reply_timeout)
             reply = json.loads(reply_json.decode('utf-8'))
             del reply_json
         else:
@@ -173,6 +182,21 @@ class ClientConnection:
         else:
             record_frame('error')
             raise ClientError('Protocol error')
+
+
+def enable_keepalive(sock):
+    '''Enable TCP keepalive on ``sock`` with the aggressive Linux tuning above, where available.'''
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (('TCP_KEEPIDLE', KEEPALIVE_IDLE_SECONDS),
+                            ('TCP_KEEPINTVL', KEEPALIVE_INTERVAL_SECONDS),
+                            ('TCP_KEEPCNT', KEEPALIVE_COUNT)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError as e:
+        logger.warning('Could not enable TCP keepalive: %r', e)
 
 
 def sha1_b64(data):

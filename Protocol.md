@@ -8,6 +8,13 @@ The connection can be wrapped into TLS – in that case both Agent and Server mu
 
 Purpose of the connection is to transfer a log file content from Agent to Server.
 
+Connections are long-lived and may stay idle for hours while a log file is
+quiet, so neither side drops an authenticated connection for being idle. Both
+sides enable TCP keepalive (on Linux: first probe after 30 s idle, then every
+10 s, give up after 3 probes) so a half-open connection, whose peer host
+vanished, is detected within about a minute. The agent also waits at most
+`reply_timeout_seconds` (default 60) for the reply to each frame.
+
 The agent is the sole authority on file identity and rotation. Each connection is
 bound to one explicit **`target`** filename chosen by the agent; the server only
 appends bytes to that target and renames it when told to. It never decides file
@@ -21,19 +28,29 @@ Handshake
 Agent (A) connects to Server (S)
 A: logline-agent-v1 153\n
 A: {"hostname": "server.example.com", "directory": "/var/log", "target": "something.log", "prefix": {"length": 42, "sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}, "auth": {"client_token": "..."}}\n
-S: ok 44\n
-S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM="}\n
+S: ok 83\n
+S: {"length": 195, "prefix_sha1": "aTQsXDnlrl8Ad67MMsD4GBH7gZM=", "prefix_length": 42}\n
 ```
 
 The agent sends the source `directory` and the destination leaf `target`
 separately. The server maps `directory` to `<dest>/<hostname>/<mangled-directory>`
 (each `/` becomes `~`) and writes to `<that directory>/<target>`; it never derives
 a filename from content. It opens the target if it exists and **reports** its
-current `length` and the SHA-1 (base64) of its first `prefix.length` bytes as
-`prefix_sha1` (`null` if the target does not exist). The server never rotates. The
-agent compares `prefix_sha1` with the inode it intends to stream and decides what
-to do (resume, or seal a stale target aside first). A handshake without a valid
-`target` is rejected.
+current `length` and the SHA-1 (base64) of its first `min(length, prefix.length)`
+bytes as `prefix_sha1` (`null` if nothing was hashed, i.e. the target does not
+exist, is empty, or the agent sent `prefix.length` 0). The number of hashed bytes
+is reported as `prefix_length`. The server never rotates. A handshake without a
+valid `target` is rejected.
+
+The agent decides what to do (resume, or seal a stale target aside first). It
+hashes the first `prefix_length` bytes of the inode it intends to stream and
+resumes at `length` only if the hashes match **and** its file is at least
+`length` bytes long. Otherwise (including a non-empty target with nothing
+hashed) the target holds a different file, and the agent seals it aside first.
+
+`prefix_length` was added later. Servers that do not send it hash the same span,
+so an agent derives it as `min(length, prefix.length)`; agents that ignore it are
+unaffected.
 
 Data
 ----
@@ -48,6 +65,24 @@ S: ok\n
 The server **must** verify that `offset` equals the current length of the target
 and replies with an explicit protocol error (closing the connection) on mismatch.
 `compression` may be `null`, `"gzip"`, `"lzma"` or `"zst"`.
+
+Errors
+------
+
+When the server rejects a handshake or a frame (offset mismatch, malformed frame,
+failed authentication, failed rename, …) it replies with an `error` status and a
+JSON payload, then closes the connection:
+
+```
+S: error 64\n
+S: {"error": "Unexpected data offset: client sent 999, expected 5"}\n
+```
+
+The `error` text is informational: protocol errors carry their message, other
+failures a generic one. The reply is best effort; the agent must treat an `error`
+reply and a connection closed without a reply the same way, as a failed
+connection that it reconnects and resumes from (servers before this reply was
+added only closed the connection).
 
 Rename
 ------

@@ -9,13 +9,16 @@ original name (a new inode), and the marker siblings appear in the directory.
 
 import asyncio
 from functools import partial
+import socket
 from socket import getfqdn
+import sys
 from time import monotonic
 from types import SimpleNamespace
 
-from logline_agent.client import connect_to_server
+from logline_agent.client import ClientError, connect_to_server
 from logline_agent.coordinator import PathCoordinator
 from logline_server.main import handle_client, sha1_hex
+from pytest import mark, raises
 
 
 CLIENT_TOKEN = 'topsecret'
@@ -38,6 +41,7 @@ def make_agent_conf(port):
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
+        deleted_path_idle_seconds=5, reply_timeout_seconds=60,
         ephemeral_globs=[])
 
 
@@ -288,5 +292,346 @@ def test_no_write_before_seal_recovery(tmp_path):
             await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
         finally:
             await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def orphans_in(d):
+    return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+
+
+def test_empty_new_inode_does_not_resume_onto_stale_target(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server still holds the previous inode's content under the live
+        # target (e.g. the agent restarted across a rotation), while the new
+        # inode is still empty when the agent connects.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'OLD content of the previous inode\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            with foo.open('ab') as f:
+                f.write(b'NEW\n')
+            # An empty local prefix must not count as a match: the stale target is
+            # sealed aside instead of being appended to at its old length.
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'OLD content of the previous inode\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_local_file_shorter_than_target_is_a_different_file(tmp_path):
+    async def scenario(src, dst, conf):
+        # Both files start with the same bytes, but the local file is shorter
+        # than the server target, so it cannot be the inode the target mirrors.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'same start\nmore lines the new inode never had\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'same start\n')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'same start\nmore lines the new inode never had\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'same start\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_resume_when_target_is_shorter_than_prefix(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server target holds fewer bytes than the agent's prefix length, and
+        # they are the beginning of the local file: this is a plain resume. Both
+        # sides must hash the same number of bytes, or the match is missed and the
+        # target is needlessly sealed aside as an orphan.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'line one\n')
+
+        content = b'line one\n' + b'line two is long enough to exceed the prefix window\n'
+        foo = src / 'foo.log'
+        foo.write_bytes(content)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == content)
+            assert orphans_in(d) == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_truncated_live_file_is_sealed_aside_and_restreamed(tmp_path):
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'first generation, long enough to be truncated\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'first generation, long enough to be truncated\n')
+            # copytruncate: the same inode shrinks below the shipped offset
+            with foo.open('r+b') as f:
+                f.truncate(0)
+            with foo.open('ab') as f:
+                f.write(b'second gen\n')
+            # The old mirror is sealed aside as an orphan and the inode is
+            # streamed again from offset 0 into a fresh live target.
+            await wait_until(lambda: bool(orphans_in(d)))
+            assert orphans_in(d)[0].read_bytes() == b'first generation, long enough to be truncated\n'
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'second gen\n')
+            # bytes written past the old offset later must not land in the orphan
+            with foo.open('ab') as f:
+                f.write(b'and the rest of the second generation after the old offset\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes()
+                             == b'second gen\nand the rest of the second generation after the old offset\n')
+            assert orphans_in(d)[0].read_bytes() == b'first generation, long enough to be truncated\n'
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_deleted_path_is_drained_then_released(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.deleted_path_idle_seconds = 0.3
+        foo = src / 'foo.log'
+        foo.write_bytes(b'line one\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'line one\n')
+            seg = coord.live
+            # The producer still holds the inode open after the path is deleted
+            # and writes a last line: it must be shipped before giving up.
+            with foo.open('ab') as producer:
+                foo.unlink()
+                producer.write(b'written after unlink\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'line one\nwritten after unlink\n')
+            # Once drained and idle, the coordinator ends and releases the fd and
+            # the server connection instead of holding them forever.
+            await wait_until(lambda: task.done())
+            assert task.exception() is None
+            assert seg.task.done()
+            assert seg.file_stream.closed
+            assert seg.conn.writer.is_closing()
+            # nothing is renamed for a plain deletion
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotated_away_path_never_recreated_completes_marker_seal(tmp_path):
+    async def scenario(src, dst, conf):
+        conf.deleted_path_idle_seconds = 0.3
+        foo = src / 'foo.log'
+        foo.write_bytes(b'only segment\n')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'only segment\n')
+            # lh-logrotate rotates the file away, but nothing recreates foo.log
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            # the pending marker-based seal is honoured, not dropped
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists())
+            assert not task.done()
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == b'only segment\n'
+            await wait_until(lambda: task.done())
+            assert task.exception() is None
+            assert coord.live is None and not coord.closing
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+@mark.parametrize('dropped', ['seal', 'finalize'])
+def test_dropped_rename_is_reapplied(tmp_path, dropped):
+    async def scenario(src, dst, conf):
+        # The first rename frame towards the chosen name is lost: the connection
+        # drops before the server sees it. The agent must reapply the rename after
+        # reconnecting instead of assuming it happened.
+        drop_suffix = ISO if dropped == 'seal' else SHA13
+        drops = []
+
+        async def flaky_factory(**kwargs):
+            conn = await connect_to_server(conf=conf, **kwargs)
+            send_rename = conn.send_rename
+
+            async def maybe_drop(src_name, dst_name):
+                if not drops and dst_name.endswith(drop_suffix):
+                    drops.append(dst_name)
+                    conn.close()
+                    raise ConnectionError('injected: rename frame lost')
+                return await send_rename(src_name, dst_name)
+            conn.send_rename = maybe_drop
+            return conn
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'2026-01-01 12:00:00 line one\n')
+        coord = PathCoordinator(conf, foo.resolve(), flaky_factory)
+        task = asyncio.create_task(coord.run())
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').exists())
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            with old.open('ab') as f:
+                f.write(b'2026-01-01 12:00:01 trailing\n')
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists()
+                             and sealed.read_bytes() == b'2026-01-01 12:00:00 line one\n2026-01-01 12:00:01 trailing\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            await wait_until(lambda: not coord.closing)
+            assert drops, 'the rename drop was not injected'
+            assert final.read_bytes() == b'2026-01-01 12:00:00 line one\n2026-01-01 12:00:01 trailing\n'
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_of_never_shipped_empty_file(tmp_path):
+    async def scenario(src, dst, conf):
+        # The live target was never created on the server (empty source), so the
+        # seal and finalize renames have nothing to rename; the old inode's late
+        # bytes must still end up under the finalized name.
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'new inode\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'new inode\n')
+            with old.open('ab') as f:
+                f.write(b'late line in the old inode\n')
+            await wait_until(lambda: (d / 'foo.log.{}'.format(ISO)).exists())
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == b'late line in the old inode\n'
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+@mark.skipif(not sys.platform.startswith('linux'), reason='keepalive tuning options are Linux-specific')
+def test_agent_connection_has_keepalive(tmp_path):
+    async def scenario(src, dst, conf):
+        (src / 'foo.log').write_bytes(b'x')
+        conn = await connect_to_server(conf=conf, log_path=src / 'foo.log', target='foo.log', log_prefix=b'x')
+        try:
+            sock = conn.writer.get_extra_info('socket')
+            assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) != 0
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 30
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 10
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 3
+        finally:
+            conn.close()
+
+    run(tmp_path, scenario)
+
+
+def test_unresponsive_server_times_out_per_reply_timeout(tmp_path):
+    async def scenario():
+        # A server that accepts the connection but never replies, like the far
+        # end of a half-open connection.
+        async def silent(reader, writer):
+            await reader.read()
+
+        server = await asyncio.start_server(silent, '127.0.0.1', 0)
+        conf = make_agent_conf(server.sockets[0].getsockname()[1])
+        conf.reply_timeout_seconds = 0.3
+        try:
+            t0 = monotonic()
+            with raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    connect_to_server(conf=conf, log_path=tmp_path / 'foo.log', target='foo.log', log_prefix=b''), 5)
+            assert monotonic() - t0 < 2
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_initial_connect_failure_backs_off_and_recovers(tmp_path):
+    async def scenario():
+        src = tmp_path / 'src'
+        src.mkdir()
+        dst = tmp_path / 'dst'
+        dst.mkdir()
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            port = s.getsockname()[1]
+        conf = make_agent_conf(port)
+        attempts = []
+
+        async def counting_factory(**kwargs):
+            attempts.append(monotonic())
+            return await connect_to_server(conf=conf, **kwargs)
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'shipped once the server is up\n')
+        coord = PathCoordinator(conf, foo.resolve(), counting_factory)
+        task = asyncio.create_task(coord.run())
+        server = None
+        try:
+            # The server is down: the first connect must be retried with backoff
+            # by the same segment, not fail the segment and get respawned on
+            # every coordinator tick.
+            await asyncio.sleep(0.4)
+            assert 1 <= len(attempts) <= 2
+            seg = coord.live
+            assert seg is not None and not seg.task.done()
+
+            server = await asyncio.start_server(partial(handle_client, make_server_conf(dst)), '127.0.0.1', port)
+            d = dst_dir_for(dst, src)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'shipped once the server is up\n')
+            assert coord.live is seg
+        finally:
+            await cancel(task)
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_agent_receives_explicit_error_reply(tmp_path):
+    async def scenario(src, dst, conf):
+        # The server answers a rejected handshake with an explicit `error` reply,
+        # which the agent surfaces as a ClientError (and treats as a failed
+        # connection), instead of a bare connection close.
+        conf.client_token = 'not the right token'
+        with raises(ClientError, match='Error reply'):
+            await connect_to_server(conf=conf, log_path=src / 'foo.log', target='foo.log', log_prefix=b'')
 
     run(tmp_path, scenario)

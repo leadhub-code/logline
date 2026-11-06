@@ -84,11 +84,18 @@ async def async_main(conf):
     client_factory = partial(connect_to_server, conf=conf)
     try:
         while True:
+            # A coordinator ends on its own once its path is gone and shipped, so
+            # drop finished tasks; a path that (re)appears is picked up below.
+            for p, p_task in list(watched_paths.items()):
+                if p_task.done():
+                    if p_task.cancelled() or p_task.exception() is not None:
+                        logger.warning('Task for path %s is not running; task.exception: %r',
+                                       p, None if p_task.cancelled() else p_task.exception())
+                    else:
+                        logger.info('Stopped watching %s', p)
+                    del watched_paths[p]
             for p in iter_files(conf):
                 p_task = watched_paths.get(str(p))
-                if p_task and p_task.done():
-                    logger.warning('Task for path %s is not running; task.exception: %r', p, p_task.exception())
-                    p_task = None
                 if p_task is None:
                     #logger.debug('Found out new path %s from glob %s', p, glob_str)
                     watched_paths[str(p)] = create_task(watch_path(conf, p, client_factory))
