@@ -126,7 +126,7 @@ every `/` replaced with `~`. For example:
 └── web-1.example.com/                                ← agent's hostname
     ├── var~log~nginx/                                ← /var/log/nginx
     │   ├── access.log                                ← live file
-    │   ├── access.log.20261105T000000Z.orphan        ← rotated segment
+    │   ├── access.log.20261105T000011Z.orphan        ← rotated segment
     │   └── access.log.20261106T000000Z.bd0fe0ff5ceeb ← rotated segment named via markers
     └── var~lib~docker~containers~3f2a…/
         ├── 3f2a…-json.log                            ← live file
@@ -263,11 +263,14 @@ sequenceDiagram
     A->>S: old connection: rename foo.log → foo.log.#lt;iso_dt#gt;.orphan
     S-->>A: ok (file and directory fsynced)
     A->>S: new connection: stream the new inode into foo.log
-    A->>S: old connection: drain the rest of the old inode,<br/>close it once it stops growing
+    A->>S: old connection: drain the rest of the old inode,<br/>close it after 10 minutes without growth
 ```
 
-`<iso_dt>` is the UTC time of the rotation (`YYYYMMDDTHHMMSSZ`). The wire format
-and the naming rules are described in detail in [Protocol.md](Protocol.md).
+Before sealing, the agent waits about 10 seconds for an optional
+[rotation marker](#rotation-markers), so the new file starts streaming with
+that delay. `<iso_dt>` is the agent's UTC time when it seals the segment
+(`YYYYMMDDTHHMMSSZ`). The wire format and the naming rules are described in
+detail in [Protocol.md](Protocol.md).
 
 ### Rotation markers
 
@@ -278,8 +281,8 @@ names as the tool's archive:
 
 | Marker file | Effect |
 | --- | --- |
-| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. Create it when the log is moved aside; the agent waits up to 10 seconds for it after it notices the rotation. |
-| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these appears, the agent keeps draining the old file. |
+| `foo.log.<iso_dt>.lh-logrotate-waiting` | The old segment is sealed as `foo.log.<iso_dt>` instead of `foo.log.<iso_dt>.orphan`. Create it when the log is moved aside; the agent waits about 10 seconds for it after it notices the rotation. |
+| `foo.log.<iso_dt>.<sha13>.xz.gpg.lh-logrotate-compressed`<br/>or `….lh-logrotate-uploaded` | The sealed segment `foo.log.<iso_dt>` is renamed to its final name `foo.log.<iso_dt>.<sha13>`. Until one of these appears, the agent keeps draining the old file, so a tool that creates the waiting marker must eventually create one of these too. |
 
 `<iso_dt>` uses the `YYYYMMDDTHHMMSSZ` format and `<sha13>` is 13 lowercase hex
 digits. The marker names come from lh-logrotate, an internal rotation tool that
