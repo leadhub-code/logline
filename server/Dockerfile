@@ -22,8 +22,12 @@ COPY logline_server ./logline_server
 # <base>" for a pull request merge commit. Nothing else is accepted, so the
 # value is safe to put into the code.
 ARG GIT_COMMIT=
-RUN if [ -n "$GIT_COMMIT" ]; then \
-        echo "$GIT_COMMIT" | grep -Eqx '[0-9a-f]{7,64}(-dirty|, merge of [0-9a-f]{7,64} into [0-9a-f]{7,64})?' \
+# The newline check is needed because grep matches line by line; set -e makes
+# a failing sed fail the build.
+RUN set -e; \
+    if [ -n "$GIT_COMMIT" ]; then \
+        [ "$(printf '%s' "$GIT_COMMIT" | wc -l)" -eq 0 ] || { echo "Invalid GIT_COMMIT: contains a newline" >&2; exit 1; }; \
+        printf '%s\n' "$GIT_COMMIT" | grep -Eqx '[0-9a-f]{7,64}(-dirty|, merge of [0-9a-f]{7,64} into [0-9a-f]{7,64})?' \
             || { echo "Invalid GIT_COMMIT: $GIT_COMMIT" >&2; exit 1; }; \
         sed -i "s/^git_commit = None\$/git_commit = '$GIT_COMMIT'/" logline_server/version.py; \
         grep -qx "git_commit = '$GIT_COMMIT'" logline_server/version.py; \
