@@ -17,11 +17,14 @@ COPY logline_server ./logline_server
 
 # Record the git commit the image is built from, shown by `--version`. The
 # build context does not include .git, so it has to be passed in, e.g.
-# `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`. Only hex digits (optionally
-# followed by "-dirty") are accepted so the value is safe to put into the code.
+# `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`. Accepted forms are a commit
+# hash, optionally followed by "-dirty", or "<merge>, merge of <head> into
+# <base>" for a pull request merge commit. Nothing else is accepted, so the
+# value is safe to put into the code.
 ARG GIT_COMMIT=
 RUN if [ -n "$GIT_COMMIT" ]; then \
-        echo "$GIT_COMMIT" | grep -Eqx '[0-9a-f]{7,64}(-dirty)?' || { echo "Invalid GIT_COMMIT: $GIT_COMMIT" >&2; exit 1; }; \
+        echo "$GIT_COMMIT" | grep -Eqx '[0-9a-f]{7,64}(-dirty|, merge of [0-9a-f]{7,64} into [0-9a-f]{7,64})?' \
+            || { echo "Invalid GIT_COMMIT: $GIT_COMMIT" >&2; exit 1; }; \
         sed -i "s/^git_commit = None\$/git_commit = '$GIT_COMMIT'/" logline_server/version.py; \
         grep -qx "git_commit = '$GIT_COMMIT'" logline_server/version.py; \
     fi
