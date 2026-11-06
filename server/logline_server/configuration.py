@@ -34,7 +34,8 @@ class Configuration:
 
         if cfg_path:
             cfg_dir = cfg_path.parent
-            cfg = yaml.safe_load(cfg_path.read_text())
+            # An empty or comments-only file loads as None.
+            cfg = yaml.safe_load(cfg_path.read_text()) or {}
         else:
             cfg = {}
 
