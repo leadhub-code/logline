@@ -10,6 +10,7 @@ from .client import connect_to_server
 from .configuration import Configuration
 from .coordinator import PathCoordinator
 from .telemetry import init_metrics, set_files_watched_source, shutdown_metrics
+from .version import VersionAction
 
 
 logger = getLogger(__name__)
@@ -17,6 +18,7 @@ logger = getLogger(__name__)
 
 def get_argument_parser():
     p = ArgumentParser()
+    p.add_argument('--version', action=VersionAction)
     p.add_argument('--conf', help='path to configuration file')
     p.add_argument('--log', help='path to log file')
     p.add_argument('--verbose', '-v', action='store_true')
