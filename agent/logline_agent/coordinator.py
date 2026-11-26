@@ -24,6 +24,7 @@ from glob import glob
 from logging import getLogger
 from os import fstat
 from pathlib import Path
+from time import monotonic as monotime
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
@@ -88,7 +89,8 @@ class Segment:
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
         self.task = None
-        self._lag = 0                    # bytes readable but not yet shipped
+        self._acked = 0                  # bytes of this inode the server has confirmed
+        self._caught_up_at = monotime()  # when everything readable was last shipped
 
     # -- coordinator-facing API --------------------------------------------
 
@@ -111,7 +113,7 @@ class Segment:
     # -- lifecycle ---------------------------------------------------------
 
     async def run(self):
-        register_lag_source(id(self), lambda: self._lag)
+        register_lag_source(id(self), self._shipping_lag, self._shipping_delay)
         try:
             await self._connect()
             await self._live_phase()
@@ -175,7 +177,6 @@ class Segment:
 
     async def _drain_until_idle(self):
         '''Orphan completion: drain until no growth for ``seal_idle_seconds``.'''
-        from time import monotonic as monotime
         last_active = monotime()
         while True:
             if await self._drain_available():
@@ -228,7 +229,7 @@ class Segment:
                 and (server_length > local_length
                      or reply.get('prefix_sha1') != sha1_b64(prefix[:server_length]))):
             await self._seal_stale_remote(prefix, server_length)
-        self.file_stream.seek(self.conn.header_reply['length'])
+        self._resume_at(self.conn.header_reply['length'])
 
     async def _seal_stale_remote(self, prefix, server_length):
         '''
@@ -285,7 +286,7 @@ class Segment:
             pos = self.file_stream.tell()
             chunk = self.file_stream.read(CHUNK_SIZE)
             if not chunk:
-                self._lag = 0
+                self._caught_up_at = monotime()
                 return sent_any
             try:
                 await self.conn.send_data(pos, chunk)
@@ -298,13 +299,13 @@ class Segment:
                 logger.warning('send_data on %s (target %s) failed: %r; reconnecting',
                                self.file_path, self.target, e)
                 await self._reconnect()
-                self.file_stream.seek(self.conn.header_reply['length'])
+                self._resume_at(self.conn.header_reply['length'])
                 return sent_any
             # Count only after a successful send: a failed send seeks back and
             # re-reads these bytes, so counting post-send avoids double-counting.
             record_bytes_read(len(chunk))
             sent_any = True
-            self._lag = self._stream_lag()
+            self._acked = pos + len(chunk)
 
     async def _rename(self, src, dst, fail_closed=False):
         retry_delay = 0
@@ -358,7 +359,7 @@ class Segment:
         self.target = target
         await self._reconnect()
         length = self.conn.header_reply['length']
-        self.file_stream.seek(length)
+        self._resume_at(length)
         return length
 
     def _remote_is_ours(self):
@@ -371,12 +372,28 @@ class Segment:
         self.file_stream.seek(0)
         return self.file_stream.read(self.conf.prefix_length_bytes)
 
-    def _stream_lag(self):
-        '''Bytes appended to the inode but not yet read by this segment.'''
+    def _resume_at(self, length):
+        '''Continue reading where the server's copy of the target ends.'''
+        self.file_stream.seek(length)
+        self._acked = length
+
+    def _shipping_lag(self):
+        '''
+        Bytes of this inode the server has not confirmed yet. Measured against the
+        file size rather than the read position, so it keeps growing while the
+        segment is stuck reconnecting instead of reporting the last value.
+        '''
         try:
-            return max(0, fstat(self.file_stream.fileno()).st_size - self.file_stream.tell())
-        except OSError:
+            return max(0, fstat(self.file_stream.fileno()).st_size - self._acked)
+        except (OSError, ValueError):
             return 0
+
+    def _shipping_delay(self):
+        '''Seconds since this segment last had nothing left to ship, or 0 when caught up.'''
+        if self.is_own_log or not self._shipping_lag():
+            # The agent's own log is shipped only once a minute on purpose.
+            return 0
+        return monotime() - self._caught_up_at
 
     def _close(self):
         unregister_lag_source(id(self))

@@ -16,7 +16,7 @@ def test_disabled_returns_none_and_helpers_are_noops():
     telemetry.record_rotation()
     # The observable-gauge sources stay unregistered while disabled.
     telemetry.set_files_watched_source(lambda: 7)
-    telemetry.register_lag_source('seg', lambda: 42)
+    telemetry.register_lag_source('seg', lambda: 42, lambda: 5)
     assert telemetry._files_watched_source is None
     assert 'seg' not in telemetry._lag_sources
     telemetry.unregister_lag_source('seg')
@@ -33,12 +33,16 @@ def test_enabled_builds_provider_and_observes(monkeypatch):
     assert provider is not None
     try:
         telemetry.set_files_watched_source(lambda: 3)
-        telemetry.register_lag_source('seg-a', lambda: 10)
-        telemetry.register_lag_source('seg-b', lambda: 25)
-        # The shipping-lag gauge reports a single aggregate (the max) across files.
         from opentelemetry.metrics import CallbackOptions
+        # With nothing tailed the delay gauge still reports 0, so an idle agent
+        # stays distinguishable from one that stopped exporting.
+        assert [o.value for o in telemetry._observe_shipping_delay(CallbackOptions())] == [0]
+        telemetry.register_lag_source('seg-a', lambda: 10, lambda: 120.0)
+        telemetry.register_lag_source('seg-b', lambda: 25, lambda: 3.0)
+        # The shipping gauges report a single aggregate (the max) across files.
         observations = telemetry._observe_shipping_lag(CallbackOptions())
         assert [o.value for o in observations] == [25]
+        assert [o.value for o in telemetry._observe_shipping_delay(CallbackOptions())] == [120.0]
         watched = telemetry._observe_files_watched(CallbackOptions())
         assert [o.value for o in watched] == [3]
         telemetry.record_bytes_read(2048)

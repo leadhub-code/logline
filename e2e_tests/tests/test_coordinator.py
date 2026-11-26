@@ -608,3 +608,48 @@ def test_rotation_of_empty_file_with_markers(tmp_path):
             await cancel(task)
 
     run(tmp_path, scenario)
+
+
+def test_shipping_lag_and_delay_keep_growing_while_the_server_is_unreachable(tmp_path, monkeypatch):
+    # The lag gauge used to be updated only after a successful send, so a file
+    # whose segment was stuck reconnecting reported its last value (usually 0)
+    # for as long as the outage lasted. Monitoring must see the backlog grow.
+    from logline_agent import telemetry
+    monkeypatch.setattr(telemetry, '_enabled', True)
+    monkeypatch.setattr(telemetry, '_lag_sources', {})
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        server_up = [True]
+
+        async def factory(**kwargs):
+            if not server_up[0]:
+                raise ConnectionRefusedError('simulated server outage')
+            return await connect_to_server(conf=conf, **kwargs)
+
+        coord = PathCoordinator(conf, foo.resolve(), factory)
+        task = asyncio.create_task(coord.run())
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            [(lag, delay)] = telemetry._lag_sources.values()
+            assert (lag(), delay()) == (0, 0)
+
+            server_up[0] = False
+            coord.live.conn.close()   # the established connection drops too
+            with foo.open('ab') as f:
+                f.write(LINE_TWO)
+            await wait_until(lambda: lag() == len(LINE_TWO))
+            await asyncio.sleep(0.3)
+            assert lag() == len(LINE_TWO)
+            assert delay() >= 0.3
+
+            server_up[0] = True
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE + LINE_TWO, timeout=10)
+            await wait_until(lambda: (lag(), delay()) == (0, 0))
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
