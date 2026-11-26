@@ -653,3 +653,183 @@ def test_shipping_lag_and_delay_keep_growing_while_the_server_is_unreachable(tmp
 
     run(tmp_path, scenario)
 
+
+def waiting_name(iso=ISO):
+    return 'foo.log.{}.lh-logrotate-waiting'.format(iso)
+
+
+def rotate_like_lh_logrotate(src):
+    '''lh-logrotate renames the live file itself to the .waiting name.'''
+    (src / 'foo.log').rename(src / waiting_name())
+    return src / waiting_name()
+
+
+TRAILING = b'2026-01-01 12:00:30 trailing line written to the old inode after the rotation\n'
+
+
+def test_agent_restart_while_draining_a_sealed_segment(tmp_path):
+    # The agent sealed a rotated inode and was restarted before lh-logrotate
+    # compressed it. The producer kept writing to the old inode meanwhile. The
+    # new agent process must resume that segment and finalize it, so the live
+    # twin is complete and live_cleanup can later replace it with the archive.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        d = dst_dir_for(dst, src)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            old = rotate_like_lh_logrotate(src)
+            foo.write_bytes(LINE_TWO)
+            await wait_until(lambda: (d / 'foo.log.{}'.format(ISO)).exists()
+                             and (d / 'foo.log').read_bytes() == LINE_TWO)
+        finally:
+            await cancel(task)
+
+        with old.open('ab') as f:
+            f.write(TRAILING)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.read_bytes() == LINE_ONE + TRAILING)
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == LINE_ONE + TRAILING
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+            assert (d / 'foo.log').read_bytes() == LINE_TWO
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_while_agent_is_down(tmp_path):
+    # lh-logrotate rotated the file while no agent was running, and the producer
+    # wrote more to the old inode. The server still holds the old inode's partial
+    # copy under the live name. The new agent must seal that copy under the
+    # rotation's name and complete it, not set it aside as an orphan (which would
+    # lose the trailing bytes and never be cleaned up) before streaming the new file.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        d = dst_dir_for(dst, src)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+        finally:
+            await cancel(task)
+
+        old = rotate_like_lh_logrotate(src)
+        with old.open('ab') as f:
+            f.write(TRAILING)
+        foo.write_bytes(LINE_TWO)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists() and sealed.read_bytes() == LINE_ONE + TRAILING)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            assert not [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == LINE_ONE + TRAILING
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_waiting_file_not_ours_is_not_adopted(tmp_path):
+    # Negative control: the sealed name on the server holds a different file.
+    # The agent must leave it alone and still stream the live file.
+    foreign = b'FOREIGN content under the sealed name, not a prefix of the waiting file\n'
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log.{}'.format(ISO)).write_bytes(foreign)
+        (src / waiting_name()).write_bytes(LINE_ONE)
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_TWO)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            await asyncio.sleep(0.2)
+            assert (d / 'foo.log.{}'.format(ISO)).read_bytes() == foreign
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+BANNER = b'=== application log opened, version 1.2.3, pid ===\n'  # longer than the 50-byte prefix
+INODE_A = BANNER + b'A line one\n' + b'A line two, trailing after rotation\n'
+INODE_B = BANNER + b'B first\n'
+
+
+def test_adoption_compares_whole_server_copy_not_just_prefix(tmp_path):
+    # The previous agent sealed the rotated inode A as an orphan (its marker came
+    # late) and streamed the new inode B into foo.log. A and B start with the
+    # same banner, longer than the handshake prefix. Adoption must not take B's
+    # copy for A's, rename it to A's sealed name and append A's bytes to it.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(INODE_B)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log').write_bytes(INODE_B + b'B second\n')
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.read_bytes() == INODE_A)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == INODE_B + b'B second\n')
+            assert not [p for p in d.iterdir() if p.name.endswith('.orphan')]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_sealed_copy_is_finalized_when_compressed_while_agent_was_down(tmp_path):
+    # The previous agent sealed A and stopped; lh-logrotate compressed A before
+    # the agent came back. The sealed copy must still get its final name, or
+    # live_cleanup never replaces it with the archive.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log.{}'.format(ISO)).write_bytes(INODE_A[:60])
+        (d / 'foo.log').write_bytes(INODE_B)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+        (src / 'foo.log').write_bytes(INODE_B)
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == INODE_A
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_compressed_file_never_shipped_is_not_sent_on_adoption(tmp_path):
+    # Nothing of A ever reached the server and lh-logrotate has already
+    # compressed it, so the archive covers it. Sending a fresh live copy now
+    # could outlive live_cleanup and stay as a duplicate forever.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+        (src / 'foo.log').write_bytes(INODE_B)
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == INODE_B)
+            await asyncio.sleep(0.3)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)

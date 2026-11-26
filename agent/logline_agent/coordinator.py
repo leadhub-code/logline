@@ -35,6 +35,11 @@ logger = getLogger(__name__)
 
 CHUNK_SIZE = 2 ** 20
 
+# How much of a server copy adoption compares with the local file before it
+# renames or appends to that copy. The handshake prefix (50 bytes) is not
+# enough: two inodes of one log often start with the same banner line.
+ADOPT_VERIFY_MAX_BYTES = 16 * 2 ** 20
+
 # A failed reconnect must never permanently orphan a file: retry with a
 # capped exponential backoff so a transient server outage (a rolling restart
 # that briefly refuses connections or closes the handshake) pauses shipping
@@ -88,6 +93,7 @@ class Segment:
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
+        self._adopted = False            # resumed by adopt(): start in the closing phase
         self.task = None
         self._acked = 0                  # bytes of this inode the server has confirmed
         self._caught_up_at = monotime()  # when everything readable was last shipped
@@ -115,9 +121,10 @@ class Segment:
     async def run(self):
         register_lag_source(id(self), self._shipping_lag, self._shipping_delay)
         try:
-            await self._connect()
-            await self._live_phase()
-            await self._do_seal()
+            if not self._adopted:
+                await self._connect()
+                await self._live_phase()
+                await self._do_seal()
             await self._closing_phase()
         except asyncio.CancelledError:
             raise
@@ -128,6 +135,74 @@ class Segment:
             logger.exception('Segment %s (target %s) failed: %r', self.file_path, self.target, e)
         finally:
             self._close()
+
+    async def adopt(self, basename, iso_dt, only_if_shipped=False):
+        '''
+        Take over a rotated inode that lh-logrotate set aside as
+        ``<basename>.<iso_dt>.lh-logrotate-waiting`` before this agent process
+        started: either a previous process sealed it and died while draining it,
+        or the rotation happened while no agent was running.
+
+        Find the server's copy of this inode and continue draining it into
+        ``<basename>.<iso_dt>``: under the sealed name if it was already sealed,
+        under the live name (renamed to the sealed name first) if the rotation
+        happened while the agent was down, or from scratch if nothing of it was
+        ever shipped. Must run before the new live segment connects, which would
+        otherwise seal the old inode's server copy aside as an orphan and lose its
+        trailing bytes. Return False (and leave the server alone) when the sealed
+        name holds a different file, or, with ``only_if_shipped``, when the
+        server holds no copy of this inode at all.
+        '''
+        seal_name = '{}.{}'.format(basename, iso_dt)
+        self._pending_seal = (seal_name, False, iso_dt)
+        self.role_live = False
+        self._adopted = True
+        self.target = seal_name
+        await self._reconnect()
+        if self.conn.header_reply['length'] > 0:
+            if not await self._server_copy_is_ours():
+                logger.warning('Not adopting %s: %s on the server holds a different file',
+                               self.file_path, seal_name)
+                return False
+            logger.info('Adopted %s: resuming sealed %s at %d', self.file_path, seal_name,
+                        self.conn.header_reply['length'])
+        else:
+            self.target = basename
+            await self._reconnect()
+            if self.conn.header_reply['length'] > 0 and await self._server_copy_is_ours():
+                # The rotation happened while no agent was running: the live name
+                # still holds this inode's copy. Seal it, as the agent would have.
+                await self._rename(basename, seal_name)
+                self.target = seal_name
+                logger.info('Adopted %s: sealed %s as %s at %d', self.file_path, basename, seal_name,
+                            self.conn.header_reply['length'])
+            elif only_if_shipped:
+                return False
+            else:
+                self.target = seal_name
+                await self._reconnect()
+                logger.info('Adopted %s: nothing was shipped, sending it as %s', self.file_path, seal_name)
+        self._resume_at(self.conn.header_reply['length'])
+        return True
+
+    async def _server_copy_is_ours(self):
+        '''
+        Whether the target the server just reported is a prefix of this inode,
+        compared over its whole length (up to ``ADOPT_VERIFY_MAX_BYTES``) by
+        handshaking once more with that much of the file as the prefix. Leaves
+        ``self.conn`` connected to the same target.
+        '''
+        length = self.conn.header_reply['length']
+        if length > fstat(self.file_stream.fileno()).st_size or not self._remote_is_ours():
+            return False
+        if length <= len(self._handshake_prefix):
+            return True
+        self.file_stream.seek(0)
+        head = self.file_stream.read(min(length, ADOPT_VERIFY_MAX_BYTES))
+        self.conn.close()
+        self.conn = await self.server(log_path=self.file_path, target=self.target, log_prefix=head)
+        reply = self.conn.header_reply
+        return reply['length'] >= len(head) and reply.get('prefix_sha1') == sha1_b64(head)
 
     async def _live_phase(self):
         while self._pending_seal is None:
@@ -431,6 +506,7 @@ class PathCoordinator:
     async def run(self):
         marker_task = create_task(self.markers.run())
         try:
+            await self._adopt_waiting()
             while True:
                 self._reap_closing()
                 if self.live is not None and self.live.task is not None and self.live.task.done():
@@ -454,6 +530,45 @@ class PathCoordinator:
                 if seg is not None and seg.task is not None:
                     seg.task.cancel()
                     await _cancel(seg.task)
+
+    async def _adopt_waiting(self):
+        '''
+        On start, finish shipping rotated inodes a previous agent process left
+        behind (see ``Segment.adopt``). Every ``.waiting`` marker present now is
+        marked consumed, adopted or not, so a later rotation never reuses its
+        ``<iso_dt>``.
+        '''
+        self.markers.scan()
+        # Oldest first: a newer rotation's file must not claim the live target
+        # that still holds an older rotation's copy.
+        for iso_dt in sorted(self.markers.waiting_isos):
+            self.consumed_isos.add(iso_dt)
+            waiting = self.file_path.parent / '{}.{}.lh-logrotate-waiting'.format(self.basename, iso_dt)
+            try:
+                f = waiting.open('rb')
+            except OSError as e:
+                if not isinstance(e, FileNotFoundError):
+                    logger.warning('Cannot open %s to adopt it: %r', waiting, e)
+                continue
+            seg = self._make_segment(f, fstat(f.fileno()).st_ino, target=self.basename, role_live=False)
+            # Once lh-logrotate has compressed it, the archive is (or soon will
+            # be) searchable, so only finish a copy the server already holds:
+            # its finalized name lets live_cleanup remove it. Sending a new copy
+            # could land after live_cleanup ran and stay as a duplicate forever.
+            compressed = self.markers.sha13_for(iso_dt) is not None
+            try:
+                adopted = await seg.adopt(self.basename, iso_dt, only_if_shipped=compressed)
+            except asyncio.CancelledError:
+                seg._close()
+                raise
+            except Exception as e:
+                logger.exception('Adopting %s failed: %r', waiting, e)
+                adopted = False
+            if adopted:
+                seg.start()
+                self.closing.add(seg)
+            else:
+                seg._close()
 
     async def _on_new_inode(self, inode):
         f = self.file_path.open('rb')
