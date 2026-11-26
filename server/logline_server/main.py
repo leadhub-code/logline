@@ -11,6 +11,7 @@ from logging.handlers import WatchedFileHandler
 import lzma
 import os
 from reprlib import repr as smart_repr
+import socket
 from ssl import Purpose, create_default_context
 from time import monotonic as monotime
 
@@ -40,6 +41,14 @@ logger = getLogger(__name__)
 # connections are intentionally allowed to stay idle for as long as needed,
 # since the agent only sends data when the watched log grows.
 handshake_timeout = 30
+
+# Established connections may stay idle indefinitely, so the server needs TCP
+# keepalive to notice a peer that vanished without closing the connection (a
+# rebooted or partitioned agent host). Without it such half-open connections
+# pile up forever, each holding an open fd on its target file.
+keepalive_idle_seconds = 60
+keepalive_interval_seconds = 10
+keepalive_probes = 6
 
 
 def server_main():
@@ -130,6 +139,7 @@ async def handle_client(conf, reader, writer):
     try:
         addr = writer.get_extra_info('peername')
         logger.debug('New client has connected: %s', addr)
+        enable_keepalive(writer.get_extra_info('socket'))
         try:
             command, metadata, data = await wait_for(recv_command(reader, first=True), timeout=handshake_timeout)
         except ReceivedHTTPRequestError:
@@ -249,7 +259,11 @@ async def serve_client(conf, reader, writer, dst_dir, target, prefix_length):
                         raise ProtocolError(
                             'First append to a new target {} must be at offset 0, got {!r}'.format(dst_path, offset))
                     logger.info('Creating new target: %s', dst_path)
-                    f = dst_path.open('wb+')
+                    # Without O_TRUNC: another connection may have created and
+                    # written the target since this one's handshake; truncating
+                    # would discard those bytes. apply_data then rejects the
+                    # offset 0 frame against the real size.
+                    f = os.fdopen(os.open(dst_path, os.O_RDWR | os.O_CREAT, 0o666), 'rb+')
                 await apply_data(f, dst_path, metadata, data)
                 await send_reply(writer, 'ok', None)
             elif command == 'rename':
@@ -284,9 +298,16 @@ async def apply_data(f, dst_path, metadata, data):
     offset = metadata.get('offset')
     if not isinstance(offset, int) or isinstance(offset, bool):
         raise ProtocolError(f'Invalid data offset: {smart_repr(offset)}')
-    if offset != f.tell():
+    # Compare with the file's real size, not this fd's position. Another
+    # connection to the same target (a stale one the agent abandoned while a
+    # frame was still in flight, or a second agent) may have appended since this
+    # fd last wrote; trusting the fd position would overwrite those bytes, or,
+    # if the file shrank, write past the end and leave a NUL-filled hole.
+    size = os.fstat(f.fileno()).st_size
+    if offset != size:
         record_protocol_error('offset_mismatch')
-        raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {f.tell()}')
+        raise ProtocolError(f'Unexpected data offset: client sent {smart_repr(offset)}, expected {size}')
+    f.seek(size)
     logger.debug('Writing %d bytes at offset %s to file %s (fd: %s)', len(data), f.tell(), dst_path, f.fileno())
     t0 = monotime()
     f.write(data)
@@ -341,6 +362,21 @@ def handle_rename(dst_dir, current_path, f, metadata):
 
     fsync_dir(dst_dir)
     return new_path if fd_follows else current_path
+
+
+def enable_keepalive(sock):
+    '''Turn on TCP keepalive with short timers where the platform supports them.'''
+    if sock is None or not hasattr(sock, 'setsockopt'):
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (('TCP_KEEPIDLE', keepalive_idle_seconds),
+                            ('TCP_KEEPINTVL', keepalive_interval_seconds),
+                            ('TCP_KEEPCNT', keepalive_probes)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError as e:
+        logger.warning('Could not enable TCP keepalive: %r', e)
 
 
 def fsync_dir(path):
