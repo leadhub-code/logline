@@ -24,6 +24,7 @@ from glob import glob
 from logging import getLogger
 from os import fstat
 from pathlib import Path
+from time import monotonic as monotime
 
 from .client import sha1_b64
 from .marker_watcher import MarkerWatcher
@@ -33,6 +34,11 @@ from .telemetry import record_bytes_read, record_rotation, register_lag_source, 
 logger = getLogger(__name__)
 
 CHUNK_SIZE = 2 ** 20
+
+# How much of a server copy adoption compares with the local file before it
+# renames or appends to that copy. The handshake prefix (50 bytes) is not
+# enough: two inodes of one log often start with the same banner line.
+ADOPT_VERIFY_MAX_BYTES = 16 * 2 ** 20
 
 # A failed reconnect must never permanently orphan a file: retry with a
 # capped exponential backoff so a transient server outage (a rolling restart
@@ -83,11 +89,14 @@ class Segment:
         self.ephemeral = ephemeral
 
         self.conn = None
+        self._handshake_prefix = b''    # prefix sent in the latest handshake
         self._pending_seal = None        # (seal_name, is_orphan, iso_dt) once requested
         self._sealed = asyncio.Event()   # set after the seal rename is acked
         self._no_resume = False          # ephemeral orphan closing: fail closed, never reconnect
+        self._adopted = False            # resumed by adopt(): start in the closing phase
         self.task = None
-        self._lag = 0                    # bytes readable but not yet shipped
+        self._acked = 0                  # bytes of this inode the server has confirmed
+        self._caught_up_at = monotime()  # when everything readable was last shipped
 
     # -- coordinator-facing API --------------------------------------------
 
@@ -110,11 +119,12 @@ class Segment:
     # -- lifecycle ---------------------------------------------------------
 
     async def run(self):
-        register_lag_source(id(self), lambda: self._lag)
+        register_lag_source(id(self), self._shipping_lag, self._shipping_delay)
         try:
-            await self._connect()
-            await self._live_phase()
-            await self._do_seal()
+            if not self._adopted:
+                await self._connect()
+                await self._live_phase()
+                await self._do_seal()
             await self._closing_phase()
         except asyncio.CancelledError:
             raise
@@ -125,6 +135,74 @@ class Segment:
             logger.exception('Segment %s (target %s) failed: %r', self.file_path, self.target, e)
         finally:
             self._close()
+
+    async def adopt(self, basename, iso_dt, only_if_shipped=False):
+        '''
+        Take over a rotated inode that lh-logrotate set aside as
+        ``<basename>.<iso_dt>.lh-logrotate-waiting`` before this agent process
+        started: either a previous process sealed it and died while draining it,
+        or the rotation happened while no agent was running.
+
+        Find the server's copy of this inode and continue draining it into
+        ``<basename>.<iso_dt>``: under the sealed name if it was already sealed,
+        under the live name (renamed to the sealed name first) if the rotation
+        happened while the agent was down, or from scratch if nothing of it was
+        ever shipped. Must run before the new live segment connects, which would
+        otherwise seal the old inode's server copy aside as an orphan and lose its
+        trailing bytes. Return False (and leave the server alone) when the sealed
+        name holds a different file, or, with ``only_if_shipped``, when the
+        server holds no copy of this inode at all.
+        '''
+        seal_name = '{}.{}'.format(basename, iso_dt)
+        self._pending_seal = (seal_name, False, iso_dt)
+        self.role_live = False
+        self._adopted = True
+        self.target = seal_name
+        await self._reconnect()
+        if self.conn.header_reply['length'] > 0:
+            if not await self._server_copy_is_ours():
+                logger.warning('Not adopting %s: %s on the server holds a different file',
+                               self.file_path, seal_name)
+                return False
+            logger.info('Adopted %s: resuming sealed %s at %d', self.file_path, seal_name,
+                        self.conn.header_reply['length'])
+        else:
+            self.target = basename
+            await self._reconnect()
+            if self.conn.header_reply['length'] > 0 and await self._server_copy_is_ours():
+                # The rotation happened while no agent was running: the live name
+                # still holds this inode's copy. Seal it, as the agent would have.
+                await self._rename(basename, seal_name)
+                self.target = seal_name
+                logger.info('Adopted %s: sealed %s as %s at %d', self.file_path, basename, seal_name,
+                            self.conn.header_reply['length'])
+            elif only_if_shipped:
+                return False
+            else:
+                self.target = seal_name
+                await self._reconnect()
+                logger.info('Adopted %s: nothing was shipped, sending it as %s', self.file_path, seal_name)
+        self._resume_at(self.conn.header_reply['length'])
+        return True
+
+    async def _server_copy_is_ours(self):
+        '''
+        Whether the target the server just reported is a prefix of this inode,
+        compared over its whole length (up to ``ADOPT_VERIFY_MAX_BYTES``) by
+        handshaking once more with that much of the file as the prefix. Leaves
+        ``self.conn`` connected to the same target.
+        '''
+        length = self.conn.header_reply['length']
+        if length > fstat(self.file_stream.fileno()).st_size or not self._remote_is_ours():
+            return False
+        if length <= len(self._handshake_prefix):
+            return True
+        self.file_stream.seek(0)
+        head = self.file_stream.read(min(length, ADOPT_VERIFY_MAX_BYTES))
+        self.conn.close()
+        self.conn = await self.server(log_path=self.file_path, target=self.target, log_prefix=head)
+        reply = self.conn.header_reply
+        return reply['length'] >= len(head) and reply.get('prefix_sha1') == sha1_b64(head)
 
     async def _live_phase(self):
         while self._pending_seal is None:
@@ -146,8 +224,9 @@ class Segment:
         # for an ephemeral orphan the destination is the shared fixed
         # `<basename>.orphan`, which a later rotation may already have clobbered
         # with a newer segment. The generic `_rename` retry reconnects to the
-        # destination and treats "it exists" as success -- unsafe here, since we
-        # could adopt (and resume onto) that newer file. So we fail closed.
+        # destination and treats "it holds the start of our file" as success --
+        # unsafe here, since a newer orphan of a repetitive source can start with
+        # the same bytes, and we could adopt (and resume onto) it. So we fail closed.
         await self._rename(self.target, seal_name, fail_closed=self.ephemeral and is_orphan)
         logger.info('Sealed %s as %s', self.file_path, seal_name)
         self.target = seal_name
@@ -173,7 +252,6 @@ class Segment:
 
     async def _drain_until_idle(self):
         '''Orphan completion: drain until no growth for ``seal_idle_seconds``.'''
-        from time import monotonic as monotime
         last_active = monotime()
         while True:
             if await self._drain_available():
@@ -197,21 +275,36 @@ class Segment:
     # -- connection / IO ---------------------------------------------------
 
     async def _connect(self):
+        # Measure the local length before reading the prefix: the server copy of
+        # this inode only holds bytes read even earlier, so it can never be longer
+        # than this. Measuring later would let the file grow in between and hide
+        # a stale remote (e.g. an empty prefix followed by fast writes).
+        local_length = fstat(self.file_stream.fileno()).st_size
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         self.conn = await self.server(
             log_path=self.file_path, target=self.target, log_prefix=prefix)
         reply = self.conn.header_reply
         server_length = reply['length']
-        # Resume detection compares only the first ``prefix_length_bytes`` (~50).
+        # Resume detection compares only the first ``prefix_length_bytes`` (~50),
+        # or fewer when the remote copy is shorter than that.
         # It is weakest for repetitive sources whose segments share an identical
         # prefix across rotations (e.g. health-check spam in Docker json logs):
         # two distinct inodes can then look like the same file and be resumed
         # onto each other. Ephemeral mode makes this recovery path routine, so
         # the caveat is worth recording; widening the prefix would harden it.
+        # A remote longer than the local file is not our copy of this inode (a
+        # different file, or this one truncated in place). This also covers an
+        # empty new inode: its empty prefix makes the server report
+        # `prefix_sha1` null, which is never treated as a match.
+        # The server hashes at most `server_length` bytes of the prefix we sent,
+        # so compare only that much: a correct copy shorter than the prefix (a log
+        # that was still short when the agent stopped) must not look different.
         if (self.role_live and server_length > 0
-                and reply.get('prefix_sha1') not in (None, sha1_b64(prefix))):
+                and (server_length > local_length
+                     or reply.get('prefix_sha1') != sha1_b64(prefix[:server_length]))):
             await self._seal_stale_remote(prefix, server_length)
-        self.file_stream.seek(self.conn.header_reply['length'])
+        self._resume_at(self.conn.header_reply['length'])
 
     async def _seal_stale_remote(self, prefix, server_length):
         '''
@@ -243,6 +336,7 @@ class Segment:
             pass
         self.conn = None
         prefix = self._read_prefix()
+        self._handshake_prefix = prefix
         backoff = RECONNECT_BACKOFF_MIN_SECONDS
         while True:
             try:
@@ -267,7 +361,7 @@ class Segment:
             pos = self.file_stream.tell()
             chunk = self.file_stream.read(CHUNK_SIZE)
             if not chunk:
-                self._lag = 0
+                self._caught_up_at = monotime()
                 return sent_any
             try:
                 await self.conn.send_data(pos, chunk)
@@ -280,15 +374,16 @@ class Segment:
                 logger.warning('send_data on %s (target %s) failed: %r; reconnecting',
                                self.file_path, self.target, e)
                 await self._reconnect()
-                self.file_stream.seek(self.conn.header_reply['length'])
+                self._resume_at(self.conn.header_reply['length'])
                 return sent_any
             # Count only after a successful send: a failed send seeks back and
             # re-reads these bytes, so counting post-send avoids double-counting.
             record_bytes_read(len(chunk))
             sent_any = True
-            self._lag = self._stream_lag()
+            self._acked = pos + len(chunk)
 
     async def _rename(self, src, dst, fail_closed=False):
+        retry_delay = 0
         while True:
             try:
                 await self.conn.send_rename(src, dst)
@@ -306,24 +401,74 @@ class Segment:
                     raise _EndSegment() from e
                 logger.warning('rename %s -> %s on %s failed: %r; reconnecting',
                                src, dst, self.file_path, e)
-                # Reconnect targeting the destination: the rename may already be
-                # applied server-side (it is idempotent), or still pending.
-                self.target = dst
-                await self._reconnect()
-                if self.conn.header_reply['length'] >= 0:
-                    # server now holds `dst`; the rename is effectively done
+                # The failure does not tell whether the server applied the rename.
+                # Ask it: reconnect targeting the destination; if that holds our
+                # data, the rename is done.
+                if await self._reconnect_to(dst) and self._remote_is_ours():
                     return
+                # Not applied. Reconnect targeting the source and retry the rename
+                # on that connection (the server's rename is idempotent).
+                if not await self._reconnect_to(src):
+                    # The source holds no data: nothing was ever sent, so there is
+                    # nothing to rename. Continue under the destination name, but
+                    # only if it is free too -- never append to someone else's file.
+                    if await self._reconnect_to(dst):
+                        raise RuntimeError(
+                            'cannot rename {} -> {}: the source is gone and the destination '
+                            'holds a different file'.format(src, dst))
+                    logger.info('rename %s -> %s on %s: nothing to rename on the server',
+                                src, dst, self.file_path)
+                    return
+                # Retry the first failure right away (the server just answered two
+                # handshakes); back off after that, so a rename the server keeps
+                # failing (e.g. a permission problem) is not retried in a tight loop.
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+                retry_delay = min(max(retry_delay * 2, RECONNECT_BACKOFF_MIN_SECONDS), RECONNECT_BACKOFF_MAX_SECONDS)
+
+    async def _reconnect_to(self, target):
+        '''
+        Reconnect with ``target`` as this segment's target and continue reading
+        where the server's copy ends. Return the server's length of ``target``.
+        '''
+        self.target = target
+        await self._reconnect()
+        length = self.conn.header_reply['length']
+        self._resume_at(length)
+        return length
+
+    def _remote_is_ours(self):
+        '''Whether the target the server just reported holds the start of our inode.'''
+        reply = self.conn.header_reply
+        # The server hashed at most `length` bytes of the prefix sent in the handshake.
+        return reply.get('prefix_sha1') == sha1_b64(self._handshake_prefix[:reply['length']])
 
     def _read_prefix(self):
         self.file_stream.seek(0)
         return self.file_stream.read(self.conf.prefix_length_bytes)
 
-    def _stream_lag(self):
-        '''Bytes appended to the inode but not yet read by this segment.'''
+    def _resume_at(self, length):
+        '''Continue reading where the server's copy of the target ends.'''
+        self.file_stream.seek(length)
+        self._acked = length
+
+    def _shipping_lag(self):
+        '''
+        Bytes of this inode the server has not confirmed yet. Measured against the
+        file size rather than the read position, so it keeps growing while the
+        segment is stuck reconnecting instead of reporting the last value.
+        '''
         try:
-            return max(0, fstat(self.file_stream.fileno()).st_size - self.file_stream.tell())
-        except OSError:
+            return max(0, fstat(self.file_stream.fileno()).st_size - self._acked)
+        except (OSError, ValueError):
             return 0
+
+    def _shipping_delay(self):
+        '''Seconds since this segment last had nothing left to ship, or 0 when caught up.'''
+        if self.is_own_log or not self._shipping_lag():
+            # The agent's own log is shipped only once a minute on purpose.
+            return 0
+        return monotime() - self._caught_up_at
 
     def _close(self):
         unregister_lag_source(id(self))
@@ -361,6 +506,7 @@ class PathCoordinator:
     async def run(self):
         marker_task = create_task(self.markers.run())
         try:
+            await self._adopt_waiting()
             while True:
                 self._reap_closing()
                 if self.live is not None and self.live.task is not None and self.live.task.done():
@@ -384,6 +530,45 @@ class PathCoordinator:
                 if seg is not None and seg.task is not None:
                     seg.task.cancel()
                     await _cancel(seg.task)
+
+    async def _adopt_waiting(self):
+        '''
+        On start, finish shipping rotated inodes a previous agent process left
+        behind (see ``Segment.adopt``). Every ``.waiting`` marker present now is
+        marked consumed, adopted or not, so a later rotation never reuses its
+        ``<iso_dt>``.
+        '''
+        self.markers.scan()
+        # Oldest first: a newer rotation's file must not claim the live target
+        # that still holds an older rotation's copy.
+        for iso_dt in sorted(self.markers.waiting_isos):
+            self.consumed_isos.add(iso_dt)
+            waiting = self.file_path.parent / '{}.{}.lh-logrotate-waiting'.format(self.basename, iso_dt)
+            try:
+                f = waiting.open('rb')
+            except OSError as e:
+                if not isinstance(e, FileNotFoundError):
+                    logger.warning('Cannot open %s to adopt it: %r', waiting, e)
+                continue
+            seg = self._make_segment(f, fstat(f.fileno()).st_ino, target=self.basename, role_live=False)
+            # Once lh-logrotate has compressed it, the archive is (or soon will
+            # be) searchable, so only finish a copy the server already holds:
+            # its finalized name lets live_cleanup remove it. Sending a new copy
+            # could land after live_cleanup ran and stay as a duplicate forever.
+            compressed = self.markers.sha13_for(iso_dt) is not None
+            try:
+                adopted = await seg.adopt(self.basename, iso_dt, only_if_shipped=compressed)
+            except asyncio.CancelledError:
+                seg._close()
+                raise
+            except Exception as e:
+                logger.exception('Adopting %s failed: %r', waiting, e)
+                adopted = False
+            if adopted:
+                seg.start()
+                self.closing.add(seg)
+            else:
+                seg._close()
 
     async def _on_new_inode(self, inode):
         f = self.file_path.open('rb')

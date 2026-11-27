@@ -106,7 +106,6 @@ class Configuration:
             raise ConfigurationError('Client token is not configured')
 
         self.prefix_length_bytes = 50
-        self.min_prefix_length_bytes = 20
 
         self.tail_read_interval_seconds = 1
         self.scan_new_files_interval_seconds = 1

@@ -96,6 +96,9 @@ def init_metrics(conf):
     meter.create_observable_gauge(
         'logline.agent.shipping_lag', callbacks=[_observe_shipping_lag], unit='By',
         description='Maximum bytes still pending shipment across tailed files')
+    meter.create_observable_gauge(
+        'logline.agent.shipping_delay', callbacks=[_observe_shipping_delay], unit='s',
+        description='Maximum seconds a tailed file has had bytes pending shipment')
 
     _enabled = True
     logger.info('Metrics enabled, exporting to %s', conf.metrics_endpoint or 'the default OTLP endpoint')
@@ -124,10 +127,18 @@ def _observe_shipping_lag(options):
     from opentelemetry.metrics import Observation
     # One aggregate across all tailed files (max), never per-file, to keep file
     # paths out of the metric labels.
-    lags = [lag for source in list(_lag_sources.values()) if (lag := source()) is not None]
+    lags = [lag_fn() for lag_fn, _ in list(_lag_sources.values())]
     if not lags:
         return []
     return [Observation(max(lags))]
+
+
+def _observe_shipping_delay(options):
+    from opentelemetry.metrics import Observation
+    # Report 0 (not nothing) with no tailed files, so an idle agent is not
+    # mistaken for one that stopped exporting.
+    delays = [delay_fn() for _, delay_fn in list(_lag_sources.values())]
+    return [Observation(max(delays, default=0))]
 
 
 def set_files_watched_source(source):
@@ -137,10 +148,13 @@ def set_files_watched_source(source):
         _files_watched_source = source
 
 
-def register_lag_source(token, source):
-    '''Register a per-segment callable returning its current shipping lag in bytes.'''
+def register_lag_source(token, lag_fn, delay_fn):
+    '''
+    Register a segment's callables returning its pending bytes and the seconds
+    those bytes have been pending.
+    '''
     if _enabled:
-        _lag_sources[token] = source
+        _lag_sources[token] = (lag_fn, delay_fn)
 
 
 def unregister_lag_source(token):

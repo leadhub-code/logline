@@ -184,3 +184,36 @@ def test_boolean_offset_is_rejected(tmp_path):
     # (bool is not accepted even though False == 0), so no file appears.
     assert writer.buffer.count(b'ok') == 1
     assert not dst_file(tmp_path).exists()
+
+
+
+def test_server_side_connection_has_keepalive(tmp_path):
+    # An idle authenticated connection is allowed to stay open forever, so the
+    # server relies on TCP keepalive to drop peers that vanished without a FIN.
+    import asyncio
+    import socket
+
+    from logline_server.main import keepalive_idle_seconds
+
+    sockets = []
+
+    async def scenario():
+        async def handler(reader, writer):
+            sockets.append(writer.get_extra_info('socket'))
+            await handle_client(make_conf(tmp_path), reader, writer)
+
+        server = await asyncio.start_server(handler, '127.0.0.1', 0)
+        port = server.sockets[0].getsockname()[1]
+        _, w = await asyncio.open_connection('127.0.0.1', port)
+        while not sockets:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)  # let handle_client run up to its first read
+        sock = sockets[0]
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
+        if hasattr(socket, 'TCP_KEEPIDLE'):
+            assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == keepalive_idle_seconds
+        w.close()
+        server.close()
+        await server.wait_closed()
+
+    run(scenario())

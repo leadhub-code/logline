@@ -95,3 +95,22 @@ the server holds at most two files per source: the live `foo.log` and the last
 sealed `foo.log.orphan`. Marker-based (lh-logrotate) rotations of ephemeral
 sources are unaffected and keep the `<iso_dt>`/`<sha13>` naming above. This is a
 purely agent-side naming choice; the server and protocol are unchanged.
+
+Agent restarts
+--------------
+
+A rotated inode that lh-logrotate has set aside as
+`foo.log.<iso_dt>.lh-logrotate-waiting` but not yet compressed may still be
+receiving trailing writes when the agent restarts. On start the agent adopts each
+such file before it opens the new live segment: it resumes the server's copy
+under `foo.log.<iso_dt>` if the previous agent process had sealed it; if the
+rotation happened while no agent was running, it renames the live target
+`foo.log` to `foo.log.<iso_dt>` first, provided that target holds the start of the
+rotated inode; otherwise it sends the file from offset 0. It then drains and
+finalizes the segment as usual. Before renaming or appending to a server copy,
+the agent compares the copy's whole content (up to 16 MiB) with the file by
+repeating the handshake with that much of the file as `prefix`. If
+`foo.log.<iso_dt>` holds a different file, the agent leaves it alone. If
+lh-logrotate has already compressed the file, the agent only finishes a copy the
+server already holds and never starts a new one. Files are adopted oldest first.
+This uses only the existing handshake and `rename` frames.

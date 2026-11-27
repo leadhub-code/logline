@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from pytest import raises
 
-from logline_server.main import ProtocolError, handle_client, handle_rename, sha1_b64, sha1_hex
+from logline_server.main import ProtocolError, apply_data, handle_client, handle_rename, sha1_b64, sha1_hex
 
 
 CLIENT_TOKEN = 'secret'
@@ -204,6 +204,43 @@ def test_offset_mismatch_is_rejected(tmp_path):
     # header reply + first data reply only; the bad frame gets no 'ok'
     assert [r[0] for r in replies(writer)] == ['ok', 'ok']
     assert (dst_dir(tmp_path) / 'app.log').read_bytes() == b'hello'
+
+
+def test_offset_is_checked_against_file_size_not_fd_position(tmp_path):
+    # Two connections hold the same target open: a stale one the agent gave up
+    # on, and the one it reconnected with. After the new one appends, the stale
+    # fd's position no longer matches the file. A late frame on the stale fd at
+    # its old position must not overwrite the appended bytes, and the next frame
+    # at the real end of file must be accepted on either fd.
+    path = tmp_path / 'app.log'
+    path.write_bytes(b'')
+    meta = lambda offset: {'offset': offset, 'compression': None}  # noqa: E731
+    with path.open('rb+') as stale, path.open('rb+') as fresh:
+        run(apply_data(fresh, path, meta(0), b'first line\n'))
+        with raises(ProtocolError):
+            run(apply_data(stale, path, meta(0), b'XXXXXXXXXXX\n'))
+        run(apply_data(stale, path, meta(11), b'second line\n'))
+        run(apply_data(fresh, path, meta(23), b'third line\n'))
+    assert path.read_bytes() == b'first line\nsecond line\nthird line\n'
+
+
+def test_late_first_frame_does_not_truncate_a_target_created_meanwhile(tmp_path):
+    # A stale connection saw no target in its handshake. Meanwhile another
+    # connection created the target and wrote to it. The stale connection's late
+    # first frame at offset 0 must be rejected, not truncate the file.
+    d = dst_dir(tmp_path)
+    d.mkdir(parents=True)
+
+    class CreateOnHandshake(FakeReader):
+        async def readline(self):
+            line = await super().readline()
+            if line.startswith(b'data'):
+                (d / 'app.log').write_bytes(b'written by the other connection\n')
+            return line
+
+    reader = CreateOnHandshake(hello('app.log', b'x') + data_frame(0, b'late frame\n'))
+    run(handle_client(make_conf(tmp_path), reader, FakeWriter()))
+    assert (d / 'app.log').read_bytes() == b'written by the other connection\n'
 
 
 # --- handle_rename unit tests ---------------------------------------------

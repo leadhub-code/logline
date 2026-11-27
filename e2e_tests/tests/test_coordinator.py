@@ -13,9 +13,12 @@ from socket import getfqdn
 from time import monotonic
 from types import SimpleNamespace
 
+from logline_agent import coordinator as coordinator_module
 from logline_agent.client import connect_to_server
 from logline_agent.coordinator import PathCoordinator
+import logline_server.main as server_main
 from logline_server.main import handle_client, sha1_hex
+import pytest
 
 
 CLIENT_TOKEN = 'topsecret'
@@ -34,7 +37,7 @@ def make_agent_conf(port):
     return SimpleNamespace(
         server_host='127.0.0.1', server_port=port,
         client_token=CLIENT_TOKEN, use_tls=False, tls_cert_file=None,
-        prefix_length_bytes=50, min_prefix_length_bytes=20,
+        prefix_length_bytes=50,
         tail_read_interval_seconds=0.02, scan_new_files_interval_seconds=0.02,
         rotated_files_inactivity_threshold_seconds=0.2,
         seal_marker_grace_seconds=0.15, seal_idle_seconds=0.2,
@@ -268,6 +271,124 @@ def test_ephemeral_orphan_closing_failure_does_not_resume(tmp_path):
     run(tmp_path, scenario)
 
 
+def test_empty_new_file_does_not_resume_onto_stale_remote(tmp_path):
+    async def scenario(src, dst, conf):
+        # The agent missed a rotation (e.g. it was down): the server still holds
+        # the old segment under the live target, and the new inode is still empty.
+        # An empty file has an empty prefix, so the prefix comparison alone cannot
+        # tell the two files apart.
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(b'OLD stale content from a missed segment\n')
+
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        try:
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
+
+            # the new file must arrive complete, not cut off at the old length
+            # and appended after the stale content
+            foo.write_bytes(b'NEW line one\nNEW line two, long enough to pass the old length\n')
+            await wait_until(lambda: (d / 'foo.log').read_bytes()
+                             == b'NEW line one\nNEW line two, long enough to pass the old length\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_empty_prefix_then_growth_during_handshake(tmp_path):
+    # Same missed rotation as above, but the producer writes more than the old
+    # segment's length while the first handshake is in flight: the prefix was
+    # read while the file was still empty, the file is long by the time the
+    # reply arrives. The stale remote must still be sealed aside.
+    old = b'OLD stale content from a missed segment\n'
+    new = b'NEW line one\nNEW line two, long enough to pass the old length\n'
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(old)
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        calls = []
+
+        async def factory(**kwargs):
+            conn = await connect_to_server(conf=conf, **kwargs)
+            if not calls:
+                with foo.open('ab') as f:
+                    f.write(new)
+            calls.append(kwargs)
+            return conn
+
+        coord = PathCoordinator(conf, foo.resolve(), factory)
+        task = asyncio.create_task(coord.run())
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == new)
+            orphans = [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            assert [o.read_bytes() for o in orphans] == [old]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_resume_onto_remote_shorter_than_prefix(tmp_path):
+    # The server holds a correct copy of our inode that is shorter than the
+    # agent's 50-byte prefix (the log was short when the agent stopped), and the
+    # file grew while the agent was down. The server can only hash the bytes it
+    # has, so the agent must compare just that much of its prefix and resume,
+    # instead of sealing the correct copy aside and re-sending it.
+    short = b'service started\n'
+    more = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(short)
+        foo = src / 'foo.log'
+        foo.write_bytes(short + more)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == short + more)
+            await asyncio.sleep(0.1)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_short_stale_remote_with_different_content_is_sealed(tmp_path):
+    # Negative control for the test above: a remote shorter than the prefix that
+    # is NOT the start of our file must still be sealed aside, even though the
+    # local file is longer (so the length check alone does not catch it).
+    stale = b'old segment\n'
+    current = b'2026-11-06 23:00:00 request handled ok\n' * 3
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(stale)
+        foo = src / 'foo.log'
+        foo.write_bytes(current)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            def orphan_sealed():
+                return [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            await wait_until(lambda: bool(orphan_sealed()))
+            assert orphan_sealed()[0].read_bytes() == stale
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == current)
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
 def test_no_write_before_seal_recovery(tmp_path):
     async def scenario(src, dst, conf):
         # server already holds a different (older) file under the live target
@@ -286,6 +407,428 @@ def test_no_write_before_seal_recovery(tmp_path):
             assert orphan_sealed()[0].read_bytes() == b'OLD stale content from a missed segment\n'
             # and the new content is streamed cleanly into the live target
             await wait_until(lambda: (d / 'foo.log').read_bytes() == b'NEW current inode content\n')
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+# Lines longer than the agent's 50-byte prefix, so a wrong read position after
+# a reconnect would show up as an offset mismatch on the server.
+LINE_ONE = b'2026-01-01 12:00:00 line one, long enough to exceed the agent prefix length\n'
+LINE_TWO = b'2026-01-01 12:05:00 line two, long enough to exceed the agent prefix length\n'
+
+
+def rotate_with_markers(src):
+    rotate_aside(src, 'foo.log', ISO)
+    (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+    (src / 'foo.log').write_bytes(LINE_TWO)
+    (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+
+
+@pytest.mark.parametrize('failing_rename', ['seal', 'finalize'])
+@pytest.mark.parametrize('mode', ['dropped', 'reply-lost'])
+def test_failed_rename_is_recovered(tmp_path, monkeypatch, failing_rename, mode):
+    # The connection fails around a rename frame: either before the server
+    # applies it (e.g. the server is restarting), or after it applied it but
+    # before the reply reached the agent. The agent must find out which one
+    # happened and end up with the rename applied exactly once.
+    fail_to = 'foo.log.{}'.format(ISO) if failing_rename == 'seal' else 'foo.log.{}.{}'.format(ISO, SHA13)
+    original_handle_rename = server_main.handle_rename
+    failed = []
+    protocol_errors = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not failed:
+            failed.append(metadata)
+            if mode == 'reply-lost':
+                original_handle_rename(dst_dir, current_path, f, metadata)
+            raise ConnectionResetError('simulated connection drop around the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    monkeypatch.setattr(server_main, 'record_protocol_error', protocol_errors.append)
+    # A backoff this long would time the test out, so it fails if the first
+    # retry is delayed by the backoff.
+    monkeypatch.setattr(coordinator_module, 'RECONNECT_BACKOFF_MIN_SECONDS', 30)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            # a single failure is retried right away, without waiting for a backoff
+            await wait_until(lambda: final.exists())
+            assert failed, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            # no leftover sealed segment and no duplicate copy sealed aside as an orphan
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+            # the agent resumed at the right offset after reconnecting
+            assert protocol_errors == []
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def drop_first_rename_to(monkeypatch, fail_to):
+    original_handle_rename = server_main.handle_rename
+    dropped = []
+
+    def flaky_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == fail_to and not dropped:
+            dropped.append(metadata)
+            raise ConnectionResetError('simulated connection drop before the rename')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    monkeypatch.setattr(server_main, 'handle_rename', flaky_handle_rename)
+    return dropped
+
+
+def test_failed_rename_does_not_adopt_foreign_destination(tmp_path, monkeypatch):
+    # After a failed seal rename the destination name already holds a file that
+    # is not ours. The agent must not take it for its applied rename (and append
+    # to it); it has to retry the rename of its own data.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            (d / 'foo.log.{}'.format(ISO)).write_bytes(foreign)
+            rotate_with_markers(src)
+
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert dropped, 'the simulated failure was not triggered'
+            assert final.read_bytes() == LINE_ONE
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_failed_rename_of_unsent_segment_does_not_append_to_foreign_file(tmp_path, monkeypatch):
+    # Nothing of the old (empty) inode was sent, so the server has no source to
+    # rename, and the destination name holds a foreign file. The agent must not
+    # continue under that name and append its trailing bytes to the foreign file.
+    dropped = drop_first_rename_to(monkeypatch, 'foo.log.{}'.format(ISO))
+    foreign = b'FOREIGN file that happens to use the same name, not ours at all\n'
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        foreign_path = d / 'foo.log.{}'.format(ISO)
+        foreign_path.write_bytes(foreign)
+        try:
+            await wait_until(lambda: coord.live is not None and coord.live.conn is not None)
+            old = rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(LINE_TWO)
+            await wait_until(lambda: bool(dropped))
+            with old.open('ab') as f:
+                # longer than the foreign file, so resuming at its length would append
+                f.write(b'trailing bytes of the old inode, written after the rotation\n' * 3)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            await asyncio.sleep(0.3)
+            assert foreign_path.read_bytes() == foreign
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_persistently_failing_rename_backs_off(tmp_path, monkeypatch):
+    # A rename the server can never apply (e.g. a permission problem in the
+    # destination directory) must not be retried in a tight loop.
+    attempts = []
+
+    def failing_handle_rename(dst_dir, current_path, f, metadata):
+        if metadata.get('to') == 'foo.log.{}.{}'.format(ISO, SHA13):
+            attempts.append(metadata)
+            raise PermissionError('simulated permanent rename failure')
+        return original_handle_rename(dst_dir, current_path, f, metadata)
+
+    original_handle_rename = server_main.handle_rename
+    monkeypatch.setattr(server_main, 'handle_rename', failing_handle_rename)
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            rotate_with_markers(src)
+            await wait_until(lambda: bool(attempts))
+            await asyncio.sleep(2)
+            assert len(attempts) <= 5
+            # the live segment is unaffected
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_of_empty_file_with_markers(tmp_path):
+    # Nothing was ever sent for the old (empty) inode, so the server holds
+    # neither the source nor the destination name of the seal and finalize
+    # renames. The agent must carry on rather than get stuck retrying them.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(b'')
+        coord, task = start_coordinator(conf, foo)
+        d = dst_dir_for(dst, src)
+        try:
+            await asyncio.sleep(0.1)
+            rotate_aside(src, 'foo.log', ISO)
+            (src / 'foo.log.{}.lh-logrotate-waiting'.format(ISO)).write_bytes(b'')
+            foo.write_bytes(b'2026-01-01 12:05:00 line two\n')
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == b'2026-01-01 12:05:00 line two\n')
+            await asyncio.sleep(0.3)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_shipping_lag_and_delay_keep_growing_while_the_server_is_unreachable(tmp_path, monkeypatch):
+    # The lag gauge used to be updated only after a successful send, so a file
+    # whose segment was stuck reconnecting reported its last value (usually 0)
+    # for as long as the outage lasted. Monitoring must see the backlog grow.
+    from logline_agent import telemetry
+    monkeypatch.setattr(telemetry, '_enabled', True)
+    monkeypatch.setattr(telemetry, '_lag_sources', {})
+
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        server_up = [True]
+
+        async def factory(**kwargs):
+            if not server_up[0]:
+                raise ConnectionRefusedError('simulated server outage')
+            return await connect_to_server(conf=conf, **kwargs)
+
+        coord = PathCoordinator(conf, foo.resolve(), factory)
+        task = asyncio.create_task(coord.run())
+        d = dst_dir_for(dst, src)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            [(lag, delay)] = telemetry._lag_sources.values()
+            assert (lag(), delay()) == (0, 0)
+
+            server_up[0] = False
+            coord.live.conn.close()   # the established connection drops too
+            with foo.open('ab') as f:
+                f.write(LINE_TWO)
+            await wait_until(lambda: lag() == len(LINE_TWO))
+            await asyncio.sleep(0.3)
+            assert lag() == len(LINE_TWO)
+            assert delay() >= 0.3
+
+            server_up[0] = True
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE + LINE_TWO, timeout=10)
+            await wait_until(lambda: (lag(), delay()) == (0, 0))
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def waiting_name(iso=ISO):
+    return 'foo.log.{}.lh-logrotate-waiting'.format(iso)
+
+
+def rotate_like_lh_logrotate(src):
+    '''lh-logrotate renames the live file itself to the .waiting name.'''
+    (src / 'foo.log').rename(src / waiting_name())
+    return src / waiting_name()
+
+
+TRAILING = b'2026-01-01 12:00:30 trailing line written to the old inode after the rotation\n'
+
+
+def test_agent_restart_while_draining_a_sealed_segment(tmp_path):
+    # The agent sealed a rotated inode and was restarted before lh-logrotate
+    # compressed it. The producer kept writing to the old inode meanwhile. The
+    # new agent process must resume that segment and finalize it, so the live
+    # twin is complete and live_cleanup can later replace it with the archive.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        d = dst_dir_for(dst, src)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+            old = rotate_like_lh_logrotate(src)
+            foo.write_bytes(LINE_TWO)
+            await wait_until(lambda: (d / 'foo.log.{}'.format(ISO)).exists()
+                             and (d / 'foo.log').read_bytes() == LINE_TWO)
+        finally:
+            await cancel(task)
+
+        with old.open('ab') as f:
+            f.write(TRAILING)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.read_bytes() == LINE_ONE + TRAILING)
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == LINE_ONE + TRAILING
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+            assert (d / 'foo.log').read_bytes() == LINE_TWO
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_rotation_while_agent_is_down(tmp_path):
+    # lh-logrotate rotated the file while no agent was running, and the producer
+    # wrote more to the old inode. The server still holds the old inode's partial
+    # copy under the live name. The new agent must seal that copy under the
+    # rotation's name and complete it, not set it aside as an orphan (which would
+    # lose the trailing bytes and never be cleaned up) before streaming the new file.
+    async def scenario(src, dst, conf):
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_ONE)
+        d = dst_dir_for(dst, src)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_ONE)
+        finally:
+            await cancel(task)
+
+        old = rotate_like_lh_logrotate(src)
+        with old.open('ab') as f:
+            f.write(TRAILING)
+        foo.write_bytes(LINE_TWO)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.exists() and sealed.read_bytes() == LINE_ONE + TRAILING)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            assert not [p for p in d.iterdir() if p.name.endswith('.orphan')]
+            (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == LINE_ONE + TRAILING
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_waiting_file_not_ours_is_not_adopted(tmp_path):
+    # Negative control: the sealed name on the server holds a different file.
+    # The agent must leave it alone and still stream the live file.
+    foreign = b'FOREIGN content under the sealed name, not a prefix of the waiting file\n'
+
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log.{}'.format(ISO)).write_bytes(foreign)
+        (src / waiting_name()).write_bytes(LINE_ONE)
+        foo = src / 'foo.log'
+        foo.write_bytes(LINE_TWO)
+        coord, task = start_coordinator(conf, foo)
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == LINE_TWO)
+            await asyncio.sleep(0.2)
+            assert (d / 'foo.log.{}'.format(ISO)).read_bytes() == foreign
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+BANNER = b'=== application log opened, version 1.2.3, pid ===\n'  # longer than the 50-byte prefix
+INODE_A = BANNER + b'A line one\n' + b'A line two, trailing after rotation\n'
+INODE_B = BANNER + b'B first\n'
+
+
+def test_adoption_compares_whole_server_copy_not_just_prefix(tmp_path):
+    # The previous agent sealed the rotated inode A as an orphan (its marker came
+    # late) and streamed the new inode B into foo.log. A and B start with the
+    # same banner, longer than the handshake prefix. Adoption must not take B's
+    # copy for A's, rename it to A's sealed name and append A's bytes to it.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log').write_bytes(INODE_B)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log').write_bytes(INODE_B + b'B second\n')
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            sealed = d / 'foo.log.{}'.format(ISO)
+            await wait_until(lambda: sealed.read_bytes() == INODE_A)
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == INODE_B + b'B second\n')
+            assert not [p for p in d.iterdir() if p.name.endswith('.orphan')]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_sealed_copy_is_finalized_when_compressed_while_agent_was_down(tmp_path):
+    # The previous agent sealed A and stopped; lh-logrotate compressed A before
+    # the agent came back. The sealed copy must still get its final name, or
+    # live_cleanup never replaces it with the archive.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        d.mkdir(parents=True)
+        (d / 'foo.log.{}'.format(ISO)).write_bytes(INODE_A[:60])
+        (d / 'foo.log').write_bytes(INODE_B)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+        (src / 'foo.log').write_bytes(INODE_B)
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            final = d / 'foo.log.{}.{}'.format(ISO, SHA13)
+            await wait_until(lambda: final.exists())
+            assert final.read_bytes() == INODE_A
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log', final.name]
+        finally:
+            await cancel(task)
+
+    run(tmp_path, scenario)
+
+
+def test_compressed_file_never_shipped_is_not_sent_on_adoption(tmp_path):
+    # Nothing of A ever reached the server and lh-logrotate has already
+    # compressed it, so the archive covers it. Sending a fresh live copy now
+    # could outlive live_cleanup and stay as a duplicate forever.
+    async def scenario(src, dst, conf):
+        d = dst_dir_for(dst, src)
+        (src / waiting_name()).write_bytes(INODE_A)
+        (src / 'foo.log.{}.{}.xz.gpg.lh-logrotate-compressed'.format(ISO, SHA13)).write_bytes(b'')
+        (src / 'foo.log').write_bytes(INODE_B)
+        coord, task = start_coordinator(conf, src / 'foo.log')
+        try:
+            await wait_until(lambda: (d / 'foo.log').read_bytes() == INODE_B)
+            await asyncio.sleep(0.3)
+            assert sorted(p.name for p in d.iterdir()) == ['foo.log']
         finally:
             await cancel(task)
 
